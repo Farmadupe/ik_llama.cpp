@@ -750,7 +750,9 @@ json oaicompat_chat_params_parse(
                     }
                     else {
                         auto base64_data = parts[1];
+                        const int64_t t_b64 = ggml_time_us();
                         auto decoded_data = base64_decode(base64_data);
+                        g_t_base64_us.fetch_add(ggml_time_us() - t_b64);
                         out_files.push_back(decoded_data);
                     }
                 }
@@ -772,7 +774,9 @@ json oaicompat_chat_params_parse(
                 if (format != "wav" && format != "mp3") {
                     throw std::runtime_error("input_audio.format must be either 'wav' or 'mp3'");
                 }
+                const int64_t t_b64 = ggml_time_us();
                 auto decoded_data = base64_decode(data); // expected to be base64 encoded
+                g_t_base64_us.fetch_add(ggml_time_us() - t_b64);
                 out_files.push_back(decoded_data);
 
                 p["type"] = "media_marker";
@@ -1915,6 +1919,11 @@ std::string fnv_hash(const uint8_t* data, size_t len) {
 }
 
 server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files) {
+    // ---- Temporary instrumentation: sub-stages of "decode images and split inputs" ----
+    const int64_t t_mtmd_start = ggml_time_us();
+    size_t total_file_bytes = 0;
+    for (const auto& f : files) total_file_bytes += f.size();
+
     mtmd::bitmaps bitmaps;
     for (auto& file : files) {
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
@@ -1926,6 +1935,8 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
         bmp.set_id(hash.c_str());
         bitmaps.entries.push_back(std::move(bmp));
     }
+    const int64_t t_mtmd_after_bitmaps = ggml_time_us();
+
     // process prompt
     std::vector<server_tokens> inputs;
     // multimodal
@@ -1944,6 +1955,16 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
+    const int64_t t_mtmd_after_tokenize = ggml_time_us();
+
+    // Publish to the consolidated instrumentation block (printed in
+    // preprocess_print_stages_if_armed before first decode).
+    g_t_image_decode_us.store(t_mtmd_after_bitmaps - t_mtmd_start);
+    g_t_mtmd_tokenize_us.store(t_mtmd_after_tokenize - t_mtmd_after_bitmaps);
+    g_n_files.store((int64_t)files.size());
+    g_total_file_bytes.store((int64_t)total_file_bytes);
+    // ---- End instrumentation ----
+
     auto result = server_tokens(chunks, true);
     return result;
 }
@@ -1980,7 +2001,10 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
             // JSON object with prompt and multimodal key.
             std::vector<raw_buffer> files;
             for (const auto& entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
-                files.push_back(base64_decode(entry));
+                const int64_t t_b64 = ggml_time_us();
+                auto decoded = base64_decode(entry);
+                g_t_base64_us.fetch_add(ggml_time_us() - t_b64);
+                files.push_back(std::move(decoded));
             }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
         }

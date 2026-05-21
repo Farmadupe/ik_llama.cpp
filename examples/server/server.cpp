@@ -434,6 +434,7 @@ inline void signal_handler(int signal) {
 
 static void log_prompt(const gpt_params & params_base, const json & body, size_t body_size_bytes) {
     g_t_request_received_us.store(ggml_time_us());
+    preprocess_reset_instrumentation();
     LOG_TEE("Prompt received: %.3g MB\n", body_size_bytes / 1.0e6);
     if (params_base.minilog) {
         LOG_TEE("Prompt:\n%s\n", body.dump(4).c_str());

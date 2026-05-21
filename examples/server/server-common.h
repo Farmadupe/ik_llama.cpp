@@ -18,12 +18,32 @@
 
 // ---- Temporary preprocessing-stage timing instrumentation ----
 // File-scope globals so they're trivial to grep+delete when done debugging.
-// All four are wall-clock us, all reset to 0 after one print. Single-request
-// granularity; relies on coalesced/multimodal path's n_parallel=1 invariant.
+// All wall-clock us, all reset to 0 in log_prompt at request start and again
+// after printing. Single-request granularity; relies on coalesced/multimodal
+// path's n_parallel=1 invariant.
+
+// Stage checkpoint timestamps (absolute us, set once per request).
 inline std::atomic<int64_t> g_t_request_received_us{0};  // set in log_prompt (HTTP body in)
 inline std::atomic<int64_t> g_t_post_template_us{0};     // set after oaicompat_chat_params_parse (Jinja done)
 inline std::atomic<int64_t> g_t_post_tokenize_us{0};     // set after tokenize_input_prompts / process_mtmd_prompt
 inline std::atomic<int64_t> g_t_slot_launch_us{0};       // set at top of launch_slot_with_task (slot picked up)
+
+// Per-algorithmic-op accumulators (us spent in each op, summed across calls).
+inline std::atomic<int64_t> g_t_base64_us{0};            // sum of base64_decode() calls in oaicompat_chat_params_parse / tokenize_input_subprompt
+inline std::atomic<int64_t> g_t_image_decode_us{0};      // stb_image loop in process_mtmd_prompt (per-file decode + fnv_hash)
+inline std::atomic<int64_t> g_t_mtmd_tokenize_us{0};     // mtmd_tokenize() in process_mtmd_prompt (ViT preprocess)
+
+// Input-shape stats (set once in process_mtmd_prompt).
+inline std::atomic<int64_t> g_n_files{0};
+inline std::atomic<int64_t> g_total_file_bytes{0};
+
+inline void preprocess_reset_instrumentation() {
+    g_t_base64_us.store(0);
+    g_t_image_decode_us.store(0);
+    g_t_mtmd_tokenize_us.store(0);
+    g_n_files.store(0);
+    g_total_file_bytes.store(0);
+}
 
 inline void preprocess_print_stages_if_armed() {
     int64_t t_recv = g_t_request_received_us.exchange(0);
@@ -32,19 +52,38 @@ inline void preprocess_print_stages_if_armed() {
     int64_t t_tok    = g_t_post_tokenize_us.exchange(0);
     int64_t t_launch = g_t_slot_launch_us.exchange(0);
     int64_t t_decode = ggml_time_us();
-    auto sec = [](int64_t a, int64_t b) { return (double)(b - a) / 1.0e6; };
-    // Format: name field is 39 chars wide (left-justified), number starts at column 40,
-    // 8-wide right-justified with 2 decimals so decimal points align across all rows.
+    int64_t t_base64        = g_t_base64_us.exchange(0);
+    int64_t t_image_decode  = g_t_image_decode_us.exchange(0);
+    int64_t t_mtmd_tokenize = g_t_mtmd_tokenize_us.exchange(0);
+    int64_t n_files         = g_n_files.exchange(0);
+    int64_t total_file_bytes = g_total_file_bytes.exchange(0);
+
+    auto sec_us = [](int64_t us) { return (double)us / 1.0e6; };
+
+    // Avoid double-counting: base64 is broken out separately, so subtract it from
+    // the "parse json + jinja" window. The non-chat path doesn't pass through Jinja;
+    // base64 still gets accounted, just under "parse json" instead.
+    const int64_t t_pre_tok = (t_tmpl ? t_tmpl : t_tok) - t_recv;
+    const int64_t t_json_jinja_minus_b64 = t_pre_tok - t_base64;
+
+    // Format: name field 39 wide left-justified, number 8 wide right-justified
+    // with 2 decimals — decimal points align across all rows.
     fprintf(stderr, "preprocess timing:\n");
-    if (t_tmpl) {
-        fprintf(stderr, "%-39s%8.2f s\n", "* parse json + jinja:",            sec(t_recv,   t_tmpl));
-        fprintf(stderr, "%-39s%8.2f s\n", "* decode images and split inputs:", sec(t_tmpl,   t_tok));
-    } else {
-        fprintf(stderr, "%-39s%8.2f s\n", "* decode images and split inputs:", sec(t_recv,   t_tok));
+    fprintf(stderr, "%-39s%8.2f s\n", t_tmpl ? "* parse json + jinja:" : "* parse json:",
+                                                   sec_us(t_json_jinja_minus_b64));
+    fprintf(stderr, "%-39s%8.2f s\n", "* base64 decode:",            sec_us(t_base64));
+    fprintf(stderr, "%-39s%8.2f s\n", "* image decode:",             sec_us(t_image_decode));
+    fprintf(stderr, "%-39s%8.2f s\n", "* mtmd_tokenize:",            sec_us(t_mtmd_tokenize));
+    fprintf(stderr, "%-39s%8.2f s\n", "* queue + slot select:",      sec_us(t_launch - t_tok));
+    fprintf(stderr, "%-39s%8.2f s\n", "* prompt cache + batch prep:", sec_us(t_decode - t_launch));
+    fprintf(stderr, "%-39s%8.2f s\n", "* total preprocessing time:", sec_us(t_decode - t_recv));
+
+    if (n_files > 0) {
+        const double avg_mb = (double)total_file_bytes / (double)n_files / 1.0e6;
+        fprintf(stderr, "mtmd input stats:\n");
+        fprintf(stderr, "%-39s%8" PRId64 "\n",     "* images:",             n_files);
+        fprintf(stderr, "%-39s%8.3f MB\n",        "* average image size:", avg_mb);
     }
-    fprintf(stderr,     "%-39s%8.2f s\n", "* queue + slot select:",           sec(t_tok,    t_launch));
-    fprintf(stderr,     "%-39s%8.2f s\n", "* prompt cache + batch prep:",     sec(t_launch, t_decode));
-    fprintf(stderr,     "%-39s%8.2f s\n", "* total preprocessing time:",      sec(t_recv,   t_decode));
 }
 
 

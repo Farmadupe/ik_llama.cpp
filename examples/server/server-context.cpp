@@ -3907,7 +3907,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             if (slot.cache_tokens.size() && slot.cache_tokens.size() > prefix.first + 20
                                 && prefix.second >= back && prefix.first >= back) {
                                 LLAMA_LOG_INFO("After context shift :\n");
-                                print_tokens(slot.prompt_tokens, slot.cache_tokens, prefix.second - back, prefix.first - back, 50);
+                                // Commented out: leaks detokenized user prompt + cache contents into logs.
+                                // print_tokens(slot.prompt_tokens, slot.cache_tokens, prefix.second - back, prefix.first - back, 50);
                             }
 #endif
                         }
@@ -3945,7 +3946,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                                 LLAMA_LOG_WARN("Common part does not match fully\n");
                                 int32_t back = 4;
                                 if (prefix.second >= back && prefix.first >= back) {
-                                    print_tokens(slot.prompt_tokens, slot.cache_tokens, prefix.second - back, prefix.first - back, 30);
+                                    // Commented out: leaks detokenized user prompt + cache contents into logs.
+                                    // print_tokens(slot.prompt_tokens, slot.cache_tokens, prefix.second - back, prefix.first - back, 30);
                                 }
                             }
 
