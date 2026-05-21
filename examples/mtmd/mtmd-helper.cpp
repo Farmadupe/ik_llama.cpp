@@ -437,7 +437,11 @@ int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
                                    mtmd_helper_eval_batch_callback callback,
                                    void * callback_user_data) {
     const llama_model * model         = llama_get_model(lctx);
-    const int           n_mmproj_embd = llama_model_n_embd_inp(model);
+    // Row width llama_decode expects in batch.embd — matches what llm_build_inp_embd
+    // allocates for lctx.inp_embd (hparams.n_embd). mmproj already produces rows this
+    // wide for media chunks. Text rows from llama_input_embeddings may come out narrower
+    // (tok_embd->ne[0]) and are zero-padded to n_mmproj_embd by passing this as the stride.
+    const int           n_mmproj_embd  = llama_model_n_embd(model);
     const int           n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
 
     if (n_inputs == 0) {
@@ -475,7 +479,8 @@ int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
 
         if (in.is_text) {
             int32_t ret = llama_input_embeddings(lctx, in.text_tokens, in.n_text_tokens,
-                                                 buffer.data() + (size_t) offset * n_mmproj_embd);
+                                                 buffer.data() + (size_t) offset * n_mmproj_embd,
+                                                 n_mmproj_embd);
             if (ret != 0) {
                 LOG_ERR("%s: llama_input_embeddings failed on text input %zu\n", __func__, i);
                 return ret;

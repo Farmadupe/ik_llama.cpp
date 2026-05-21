@@ -131,7 +131,9 @@ def colored_square(color: str, bg: str = "white", size: int = 256) -> str:
 
 
 # ~120 reps × ~9 tokens each ≈ 1080 tokens of filler. Comfortably above n_batch=512.
-LONG_FILLER = "The quick brown fox jumps over the lazy dog. " * 120
+def long_filler(salt: str) -> str:
+    """Per-test unique long filler so each test's first run hits a cold KV cache."""
+    return f"Test scenario {salt}. " + "The quick brown fox jumps over the lazy dog. " * 120
 
 
 def chat(client: OpenAI, content, max_tokens: int = 200) -> str:
@@ -206,7 +208,7 @@ def test_many_images_colours(client):
 
 def test_long_text_prefill(client):
     out = chat(client, [
-        {"type": "text", "text": LONG_FILLER},
+        {"type": "text", "text": long_filler("long-prefill")},
         {"type": "image_url", "image_url": {"url": red_square_on_white()}},
         {"type": "text", "text": "What colour is the shape in the image? Reply with one word."},
     ], max_tokens=50)
@@ -219,7 +221,7 @@ def test_prompt_cache_reuse(client):
     Note: requires a non-recurrent-state, non-SWA model for the upstream checkpoint
     mechanism to restore the KV cache properly."""
     msg = [
-        {"type": "text", "text": LONG_FILLER},
+        {"type": "text", "text": long_filler("cache-reuse")},
         {"type": "image_url", "image_url": {"url": red_square_on_white()}},
         {"type": "text", "text": "What colour is the shape? Reply with one word."},
     ]
@@ -235,6 +237,30 @@ def test_prompt_cache_reuse(client):
     assert t_warm < t_cold * 0.6, f"expected cache reuse: cold={t_cold:.2f}s warm={t_warm:.2f}s"
 
 
+def test_prompt_cache_rewind(client):
+    """Two prompts sharing a long prefix; second prompt diverges at the suffix.
+    Verifies (a) the shared prefix is reused (warm < cold), and (b) the model
+    correctly answers the divergent suffix (not a stale cached answer)."""
+    shared_prefix = [
+        {"type": "text", "text": long_filler("cache-rewind")},
+        {"type": "image_url", "image_url": {"url": red_square_on_white()}},
+    ]
+
+    t0 = time.time()
+    out_a = chat(client, shared_prefix + [
+        {"type": "text", "text": "What colour is the shape? Reply with one word."},
+    ], max_tokens=10)
+    t_cold = time.time() - t0
+    assert "red" in out_a.lower(), out_a
+
+    t0 = time.time()
+    out_b = chat(client, shared_prefix + [
+        {"type": "text", "text": "What shape is in the image? One word: square, circle, or triangle."},
+    ], max_tokens=10)
+    t_warm = time.time() - t0
+
+    assert "square" in out_b.lower(), f"stale or wrong answer: {out_b!r}"
+    assert t_warm < t_cold * 0.7, f"expected partial-prefix reuse: cold={t_cold:.2f}s warm={t_warm:.2f}s"
 
 
 if __name__ == "__main__":

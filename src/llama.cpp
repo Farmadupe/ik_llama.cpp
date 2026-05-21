@@ -9676,7 +9676,8 @@ int32_t llama_input_embeddings(
         struct llama_context * ctx,
         const llama_token   * tokens,
         int32_t               n_tokens,
-        float               * out) {
+        float               * out,
+        int32_t               out_stride) {
     if (ctx == nullptr || tokens == nullptr || out == nullptr || n_tokens <= 0) {
         LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
         return -1;
@@ -9689,9 +9690,16 @@ int32_t llama_input_embeddings(
         return -1;
     }
 
-    // Use the actual embedding table width. Some models (factored / projected input
-    // embeddings) have tok_embd narrower than hparams.n_embd.
+    // Width of one tok_embd row. May be narrower than hparams.n_embd for architectures
+    // whose batch.embd layout concatenates extra per-layer slices alongside the base
+    // embedding (see e.g. build_qwen3.cpp); the trailing slots get zero-padded below.
     const int64_t n_embd = model.tok_embd->ne[0];
+
+    if (out_stride < (int32_t) n_embd) {
+        LLAMA_LOG_ERROR("%s: out_stride (%d) < tok_embd width (%lld)\n",
+                        __func__, out_stride, (long long) n_embd);
+        return -1;
+    }
 
     // Make sure any in-flight async work on the scheduler is done before we reset it.
     llama_synchronize(ctx);
@@ -9736,7 +9744,23 @@ int32_t llama_input_embeddings(
     llama_graph_compute(*ctx, gf, ctx->cparams.n_threads);
 
     // ggml_backend_tensor_get is synchronous, so this blocks until the compute finishes.
-    ggml_backend_tensor_get(out_tensor, out, 0, n_tokens * n_embd * sizeof(float));
+    if (out_stride == (int32_t) n_embd) {
+        // Tight packing — single contiguous copy.
+        ggml_backend_tensor_get(out_tensor, out, 0, n_tokens * n_embd * sizeof(float));
+    } else {
+        // Strided output: get rows into a temporary tight buffer, then scatter into the
+        // caller's buffer with the requested stride and zero-padded trailing slots.
+        std::vector<float> tmp((size_t) n_tokens * n_embd);
+        ggml_backend_tensor_get(out_tensor, tmp.data(), 0, n_tokens * n_embd * sizeof(float));
+        const size_t pad_floats = (size_t) out_stride - (size_t) n_embd;
+        for (int32_t i = 0; i < n_tokens; i++) {
+            float * row = out + (size_t) i * out_stride;
+            std::memcpy(row, tmp.data() + (size_t) i * n_embd, n_embd * sizeof(float));
+            if (pad_floats > 0) {
+                std::memset(row + n_embd, 0, pad_floats * sizeof(float));
+            }
+        }
+    }
 
     ggml_free(ctx0);
     return 0;
