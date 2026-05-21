@@ -519,17 +519,33 @@ int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
     }
 
     // Submit in slices of up to n_batch; llama_decode further splits internally by n_ubatch.
+    // Lazy running-average rate across every coalesced sub-batch ever processed, so single-
+    // shot small prompts still get a sane ETA on the first line.
+    static int64_t s_total_tokens  = 0;
+    static int64_t s_total_time_us = 0;
+
     const int32_t n_calls = (n_total_tokens + n_batch - 1) / n_batch;
     for (int32_t i_batch = 0; i_batch < n_calls; i_batch++) {
         const int pos_offset    = i_batch * n_batch;
         const int n_tokens_view = std::min(n_batch, n_total_tokens - pos_offset);
         llama_batch view        = batch_embd.get_view(pos_offset, n_tokens_view);
 
+        const int64_t t_sub_start = ggml_time_us();
         int32_t ret = llama_decode(lctx, view);
+        const int64_t t_sub_us = ggml_time_us() - t_sub_start;
         if (ret != 0) {
             LOG_ERR("%s: llama_decode failed on coalesced batch %d/%d\n", __func__, i_batch + 1, n_calls);
             return ret;
         }
+
+        s_total_tokens  += n_tokens_view;
+        s_total_time_us += t_sub_us;
+        const int     tokens_done = pos_offset + n_tokens_view;
+        const int     pct         = (int)((int64_t) tokens_done * 100 / n_total_tokens);
+        const double  rate_tps    = (double) s_total_tokens / ((double) s_total_time_us / 1.0e6 + 1e-9);
+        const int64_t eta_sec     = (int64_t)((n_total_tokens - tokens_done) / std::max(rate_tps, 1.0));
+        LOG_INF("coalesced prefill (%d tokens, %d%%) eta: %02d:%02d -- processed in %d ms\n",
+                tokens_done, pct, (int)(eta_sec / 60), (int)(eta_sec % 60), (int)(t_sub_us / 1000));
 
         if (callback) {
             int32_t cb_ret = callback(callback_user_data, &view);

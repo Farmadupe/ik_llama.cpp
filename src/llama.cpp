@@ -9683,12 +9683,15 @@ int32_t llama_input_embeddings(
     }
 
     const llama_model & model = ctx->model;
-    const int64_t       n_embd = model.hparams.n_embd;
 
     if (model.tok_embd == nullptr) {
         LLAMA_LOG_ERROR("%s: model has no token embedding table\n", __func__);
         return -1;
     }
+
+    // Use the actual embedding table width. Some models (factored / projected input
+    // embeddings) have tok_embd narrower than hparams.n_embd.
+    const int64_t n_embd = model.tok_embd->ne[0];
 
     // Make sure any in-flight async work on the scheduler is done before we reset it.
     llama_synchronize(ctx);
