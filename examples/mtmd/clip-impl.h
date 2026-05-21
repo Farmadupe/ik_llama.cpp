@@ -1,3 +1,5 @@
+#pragma once
+
 #include "ggml.h"
 #include "clip.h"
 

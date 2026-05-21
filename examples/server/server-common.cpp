@@ -1957,12 +1957,18 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
     }
     const int64_t t_mtmd_after_tokenize = ggml_time_us();
 
+    // Forward decls for mtmd's preprocess-cache debug accessors (defined in mtmd.cpp).
+    extern size_t mtmd_dbg_preprocess_cache_size_bytes();
+    extern size_t mtmd_dbg_preprocess_cache_size_entries();
+
     // Publish to the consolidated instrumentation block (printed in
     // preprocess_print_stages_if_armed before first decode).
     g_t_image_decode_us.store(t_mtmd_after_bitmaps - t_mtmd_start);
     g_t_mtmd_tokenize_us.store(t_mtmd_after_tokenize - t_mtmd_after_bitmaps);
     g_n_files.store((int64_t)files.size());
     g_total_file_bytes.store((int64_t)total_file_bytes);
+    g_lru_cache_bytes.store((int64_t)mtmd_dbg_preprocess_cache_size_bytes());
+    g_lru_cache_entries.store((int64_t)mtmd_dbg_preprocess_cache_size_entries());
     // ---- End instrumentation ----
 
     auto result = server_tokens(chunks, true);

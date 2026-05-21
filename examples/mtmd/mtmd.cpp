@@ -2,6 +2,7 @@
 #include "clip-impl.h"
 #include "mtmd.h"
 #include "mtmd-audio.h"
+#include "my_shitty_lru.hpp"
 
 #include "llama.h"
 
@@ -10,7 +11,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
+
+// ---- Temporary debug cache: keyed on bitmap->id (fnv hash of decoded pixel
+// bytes set by process_mtmd_prompt). Captures the full clip_image_preprocess
+// result — resize + normalize + (model-dependent) tile splitting. Global,
+// bound to one clip_ctx lifetime; do not survive a model swap.
+static MyShittySinglePurposeLru g_preprocess_cache(/*max_size_megabytes=*/ 2048);
+
+// Debug accessors so server-common.cpp can sample cache state without including
+// my_shitty_lru.hpp (which would drag clip-impl.h into a non-mtmd TU).
+size_t mtmd_dbg_preprocess_cache_size_bytes()   { return g_preprocess_cache.size_bytes();   }
+size_t mtmd_dbg_preprocess_cache_size_entries() { return g_preprocess_cache.size_entries(); }
 
 // represents raw image data, layout is RGBRGBRGB...
 // length of data must be nx * ny * 3
@@ -526,12 +539,29 @@ struct mtmd_tokenizer {
             img_u8->buf.resize(bitmap->data.size());
             std::memcpy(img_u8->buf.data(), bitmap->data.data(), img_u8->nx * img_u8->ny * 3);
 
-            // preprocess image
+            // preprocess image (cached by bitmap->id when set; bypass cache
+            // when id is empty to avoid poisoning the empty-string key).
             clip_image_f32_batch batch_f32;
-            bool ok = clip_image_preprocess(ctx->ctx_v, img_u8.get(), &batch_f32);
-            if (!ok) {
-                LOG_ERR("Unable to preprocess image\n");
-                return 2;
+            if (bitmap->id.empty()) {
+                if (!clip_image_preprocess(ctx->ctx_v, img_u8.get(), &batch_f32)) {
+                    LOG_ERR("Unable to preprocess image\n");
+                    return 2;
+                }
+            } else {
+                try {
+                    batch_f32 = g_preprocess_cache.get_or_compute(
+                        bitmap->id,
+                        [&]() {
+                            clip_image_f32_batch fresh;
+                            if (!clip_image_preprocess(ctx->ctx_v, img_u8.get(), &fresh)) {
+                                throw std::runtime_error("clip_image_preprocess failed");
+                            }
+                            return fresh;
+                        });
+                } catch (const std::exception & e) {
+                    LOG_ERR("Unable to preprocess image: %s\n", e.what());
+                    return 2;
+                }
             }
 
             // handle llava-uhd style preprocessing

@@ -37,12 +37,18 @@ inline std::atomic<int64_t> g_t_mtmd_tokenize_us{0};     // mtmd_tokenize() in p
 inline std::atomic<int64_t> g_n_files{0};
 inline std::atomic<int64_t> g_total_file_bytes{0};
 
+// Preprocess-cache state snapshot (sampled after mtmd_tokenize in process_mtmd_prompt).
+inline std::atomic<int64_t> g_lru_cache_bytes{0};
+inline std::atomic<int64_t> g_lru_cache_entries{0};
+
 inline void preprocess_reset_instrumentation() {
     g_t_base64_us.store(0);
     g_t_image_decode_us.store(0);
     g_t_mtmd_tokenize_us.store(0);
     g_n_files.store(0);
     g_total_file_bytes.store(0);
+    g_lru_cache_bytes.store(0);
+    g_lru_cache_entries.store(0);
 }
 
 inline void preprocess_print_stages_if_armed() {
@@ -83,6 +89,14 @@ inline void preprocess_print_stages_if_armed() {
         fprintf(stderr, "mtmd input stats:\n");
         fprintf(stderr, "%-39s%8" PRId64 "\n",     "* images:",             n_files);
         fprintf(stderr, "%-39s%8.3f MB\n",        "* average image size:", avg_mb);
+    }
+
+    int64_t lru_entries = g_lru_cache_entries.exchange(0);
+    int64_t lru_bytes   = g_lru_cache_bytes.exchange(0);
+    if (lru_entries > 0) {
+        fprintf(stderr, "preprocess cache stats:\n");
+        fprintf(stderr, "%-39s%8" PRId64 "\n",     "* cached entries:",     lru_entries);
+        fprintf(stderr, "%-39s%8.3f MB\n",        "* cache size:",         (double)lru_bytes / 1.0e6);
     }
 }
 
