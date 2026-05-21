@@ -11793,6 +11793,53 @@ float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id
     return it->second.data();
 }
 
+int32_t llama_input_embeddings(
+        struct llama_context * ctx,
+        const llama_token   * tokens,
+        int32_t               n_tokens,
+        float               * out,
+        int32_t               out_stride) {
+    GGML_ASSERT(ctx && tokens && out && n_tokens > 0);
+
+    ggml_tensor * tok_embd = ctx->model.tok_embd;
+
+    // Width of one tok_embd row. For qwen3vl this is narrower than hparams.n_embd
+    const int64_t n_embd = tok_embd->ne[0];
+
+    // ids + rows tensor headers, graph metadata, and the work-buffer object header
+    // (smaller than a tensor overhead; its work_size is 0 for get_rows)
+    const size_t mem_size = 3*ggml_tensor_overhead() + ggml_graph_overhead();
+
+    ggml_init_params ip = { mem_size, nullptr, /*no_alloc*/ true };
+    ggml_context * ctx0 = ggml_init(ip);
+
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ids->data = (void *) tokens;
+
+    ggml_tensor * rows = ggml_get_rows(ctx0, tok_embd, ids);
+    rows->data  = out;
+    rows->nb[1] = (size_t) out_stride*sizeof(float);
+    rows->nb[2] = rows->nb[1]*n_tokens;
+    rows->nb[3] = rows->nb[2];
+
+    ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, rows);
+
+    const ggml_status status = ggml_graph_compute_with_ctx(ctx0, gf, 1);
+    ggml_free(ctx0);
+
+    //qwen3vl text embeddings are sparesely written adn we need to zero out the rest
+    if (out_stride > (int32_t) n_embd) {
+        for (int32_t i = 0; i < n_tokens; i++) {
+            auto s = out + (size_t) i*out_stride + n_embd;
+            auto n = ((size_t) out_stride - n_embd)*sizeof(float);
+            std::memset(s, 0, n);
+        }
+    }
+
+    return status;
+}
+
 //
 // vocab
 //

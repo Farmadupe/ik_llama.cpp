@@ -1162,6 +1162,24 @@ extern "C" {
     // shape: [n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // Look up input embeddings from the model's token embedding table for a list of token ids.
+    // Rows are dequantized to F32 on the CPU.
+    //
+    // out_stride is the row stride (in floats) of the destination buffer. It must be >=
+    // tok_embd->ne[0]. When it equals tok_embd->ne[0] the output is tightly packed; when it
+    // is larger, the trailing slots in each row are zero-filled. The larger case lets the
+    // caller produce rows of llama_model_n_embd width even when tok_embd is narrower -
+    // useful for assembling batch.embd buffers whose row width must match hparams.n_embd.
+    //
+    // out must point to a caller-owned buffer of size n_tokens * out_stride floats.
+    // Returns 0 on success, non-zero on failure.
+    LLAMA_API int32_t llama_input_embeddings(
+            struct llama_context * ctx,
+            const llama_token   * tokens,
+            int32_t               n_tokens,
+            float               * out,
+            int32_t               out_stride);
+
     //
     // Vocab
     //

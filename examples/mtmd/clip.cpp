@@ -1743,12 +1743,13 @@ struct clip_graph {
                 ggml_row_size(cur->type, proj_inp_dim), 0);
             cb(cur, "proj_inp_normed", -1);
 
-            // projection mlp
+            // projection mlp; erf GELU: upstream PatchMergerMLP uses nn.GELU(),
+            // unlike the tanh GELU of the ViT blocks
             cur = build_ffn(cur,
                 model.mm_1_w, model.mm_1_b,
                 nullptr, nullptr,
                 model.mm_2_w, model.mm_2_b,
-                FFN_GELU,
+                FFN_GELU_ERF,
                 -1);
 
             cb(cur, "proj_out", -1);
