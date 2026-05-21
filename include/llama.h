@@ -1116,6 +1116,17 @@ extern "C" {
     // shape: [n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // Look up input embeddings from the model's token embedding table for a list of token ids.
+    // Runs ggml_get_rows on tok_embd via the context's scheduler, so quantized embedding tables
+    // are handled correctly. The output is always F32.
+    // out must point to a caller-owned buffer of size n_tokens * n_embd floats.
+    // Returns 0 on success, non-zero on failure.
+    LLAMA_API int32_t llama_input_embeddings(
+            struct llama_context * ctx,
+            const llama_token   * tokens,
+            int32_t               n_tokens,
+            float               * out);
+
     //
     // Vocab
     //

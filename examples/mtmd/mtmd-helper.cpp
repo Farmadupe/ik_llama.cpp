@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
 #include <vector>
 
 //#define MTMD_AUDIO_DEBUG
@@ -55,6 +56,17 @@ llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks * chunks) {
 
 // helper struct to make working with embd batch easier
 // note: this will be removed after llama_batch_ext refactoring
+// One contiguous run of either text or image rows inside a coalesced embedding buffer.
+// Used by decode_embd_batch::set_position_mixed to assign positions for batches that
+// interleave text tokens and image patches from multiple chunks.
+struct chunk_segment {
+    enum source_type { TEXT, IMAGE };
+    source_type type;
+    int32_t offset;    // start row in the embd buffer
+    int32_t n_tokens;  // rows occupied
+    int32_t nx, ny;    // IMAGE-only: ViT-output grid dimensions (n_tokens == nx*ny)
+};
+
 struct decode_embd_batch {
     int n_pos_per_embd;
     int n_mmproj_embd;
@@ -127,6 +139,57 @@ struct decode_embd_batch {
             batch.n_seq_id[i] = 1;
             batch.seq_id  [i] = seq_id_0.data();
             batch.logits  [i] = false;
+        }
+    }
+
+    // Coalesced batch mixing text tokens and image patches from multiple chunks.
+    // For non-M-RoPE (n_pos_per_embd == 1): sequential positions from pos_0.
+    // For M-RoPE (n_pos_per_embd == 4): each text token advances the temporal counter by 1
+    // and writes (t,t,t); each whole image advances the temporal counter by 1 (regardless of
+    // patch count) and emits per-patch (t, t+y, t+x). Matches the convention used by the
+    // per-chunk code path, so output equivalence holds.
+    void set_position_mixed(llama_pos pos_0,
+                            const std::vector<chunk_segment> & segments,
+                            llama_seq_id seq_id) {
+        seq_id_0[0] = seq_id;
+        for (int i = 0; i < batch.n_tokens; i++) {
+            batch.n_seq_id[i] = 1;
+            batch.seq_id  [i] = seq_id_0.data();
+            batch.logits  [i] = false;
+        }
+
+        if (n_pos_per_embd == 1) {
+            for (int i = 0; i < batch.n_tokens; i++) {
+                batch.pos[i] = pos_0 + i;
+            }
+            return;
+        }
+
+        GGML_ASSERT(n_pos_per_embd == 4);
+        llama_pos t = pos_0;
+        for (const auto & seg : segments) {
+            if (seg.type == chunk_segment::TEXT) {
+                for (int32_t i = 0; i < seg.n_tokens; i++) {
+                    const int idx = seg.offset + i;
+                    pos[idx                     ] = t + i;
+                    pos[idx + batch.n_tokens    ] = t + i;
+                    pos[idx + batch.n_tokens * 2] = t + i;
+                    pos[idx + batch.n_tokens * 3] = 0;
+                }
+                t += seg.n_tokens;
+            } else {
+                // IMAGE: all patches share temporal `t`; height/width vary across the grid.
+                for (int y = 0; y < seg.ny; y++) {
+                    for (int x = 0; x < seg.nx; x++) {
+                        const int idx = seg.offset + y * seg.nx + x;
+                        pos[idx                     ] = t;
+                        pos[idx + batch.n_tokens    ] = t + y;
+                        pos[idx + batch.n_tokens * 2] = t + x;
+                        pos[idx + batch.n_tokens * 3] = 0;
+                    }
+                }
+                t += 1; // whole image is one temporal tick
+            }
         }
     }
 
@@ -359,6 +422,125 @@ int32_t mtmd_helper_eval_chunk_single_with_callback(mtmd_context * ctx,
     }
 
     llama_batch_free(text_batch);
+    return 0;
+}
+
+int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
+                                   struct llama_context * lctx,
+                                   const struct mtmd_helper_coalesce_input * inputs,
+                                   size_t n_inputs,
+                                   llama_pos n_past,
+                                   llama_seq_id seq_id,
+                                   int32_t n_batch,
+                                   bool logits_last,
+                                   llama_pos * new_n_past,
+                                   mtmd_helper_eval_batch_callback callback,
+                                   void * callback_user_data) {
+    const llama_model * model         = llama_get_model(lctx);
+    const int           n_mmproj_embd = llama_model_n_embd_inp(model);
+    const int           n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
+
+    if (n_inputs == 0) {
+        *new_n_past = n_past;
+        return 0;
+    }
+
+    // First pass: count totals so we know how big the embd buffer needs to be.
+    int32_t   n_total_tokens = 0;
+    llama_pos n_pos_advance  = 0;
+    for (size_t i = 0; i < n_inputs; i++) {
+        const auto & in = inputs[i];
+        if (in.is_text) {
+            n_total_tokens += in.n_text_tokens;
+            n_pos_advance  += in.n_text_tokens;
+        } else {
+            n_total_tokens += (int32_t) mtmd_input_chunk_get_n_tokens(in.chunk);
+            n_pos_advance  += mtmd_input_chunk_get_n_pos(in.chunk);
+        }
+    }
+
+    if (n_total_tokens == 0) {
+        *new_n_past = n_past;
+        return 0;
+    }
+
+    // Second pass: fill the buffer and build position segments.
+    std::vector<float>         buffer((size_t) n_total_tokens * n_mmproj_embd);
+    std::vector<chunk_segment> segments;
+    segments.reserve(n_inputs);
+
+    int32_t offset = 0;
+    for (size_t i = 0; i < n_inputs; i++) {
+        const auto & in = inputs[i];
+
+        if (in.is_text) {
+            int32_t ret = llama_input_embeddings(lctx, in.text_tokens, in.n_text_tokens,
+                                                 buffer.data() + (size_t) offset * n_mmproj_embd);
+            if (ret != 0) {
+                LOG_ERR("%s: llama_input_embeddings failed on text input %zu\n", __func__, i);
+                return ret;
+            }
+            segments.push_back({chunk_segment::TEXT, offset, in.n_text_tokens, 0, 0});
+            offset += in.n_text_tokens;
+        } else {
+            const auto      type     = mtmd_input_chunk_get_type(in.chunk);
+            const int32_t   n_tokens = (int32_t) mtmd_input_chunk_get_n_tokens(in.chunk);
+
+            int32_t ret = mtmd_encode_chunk(ctx, in.chunk);
+            if (ret != 0) {
+                LOG_ERR("%s: mtmd_encode_chunk failed on media input %zu\n", __func__, i);
+                return ret;
+            }
+            float * encoded = mtmd_get_output_embd(ctx);
+            std::memcpy(buffer.data() + (size_t) offset * n_mmproj_embd, encoded,
+                        (size_t) n_tokens * n_mmproj_embd * sizeof(float));
+
+            if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                const auto * image_tokens = mtmd_input_chunk_get_tokens_image(in.chunk);
+                const int    nx           = mtmd_image_tokens_get_nx(image_tokens);
+                const int    ny           = mtmd_image_tokens_get_ny(image_tokens);
+                segments.push_back({chunk_segment::IMAGE, offset, n_tokens, nx, ny});
+            } else if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+                // Audio positions are text-like under M-RoPE (each audio token = 1 temporal tick).
+                segments.push_back({chunk_segment::TEXT, offset, n_tokens, 0, 0});
+            } else {
+                GGML_ABORT("media input must be IMAGE or AUDIO");
+            }
+            offset += n_tokens;
+        }
+    }
+
+    // Build the coalesced embd batch and assign positions.
+    decode_embd_batch batch_embd(buffer.data(), n_total_tokens, n_pos_per_embd, n_mmproj_embd);
+    batch_embd.set_position_mixed(n_past, segments, seq_id);
+
+    if (logits_last) {
+        batch_embd.batch.logits[n_total_tokens - 1] = true;
+    }
+
+    // Submit in slices of up to n_batch; llama_decode further splits internally by n_ubatch.
+    const int32_t n_calls = (n_total_tokens + n_batch - 1) / n_batch;
+    for (int32_t i_batch = 0; i_batch < n_calls; i_batch++) {
+        const int pos_offset    = i_batch * n_batch;
+        const int n_tokens_view = std::min(n_batch, n_total_tokens - pos_offset);
+        llama_batch view        = batch_embd.get_view(pos_offset, n_tokens_view);
+
+        int32_t ret = llama_decode(lctx, view);
+        if (ret != 0) {
+            LOG_ERR("%s: llama_decode failed on coalesced batch %d/%d\n", __func__, i_batch + 1, n_calls);
+            return ret;
+        }
+
+        if (callback) {
+            int32_t cb_ret = callback(callback_user_data, &view);
+            if (cb_ret != 0) {
+                LOG_ERR("%s: callback failed\n", __func__);
+                return cb_ret;
+            }
+        }
+    }
+
+    *new_n_past = n_past + n_pos_advance;
     return 0;
 }
 

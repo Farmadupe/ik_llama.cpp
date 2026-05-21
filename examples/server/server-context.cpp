@@ -314,6 +314,45 @@ bool server_context::load_model(const gpt_params& params_) {
         }
         LOG_INFO("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
+        // The coalesced prefill path (which this server unconditionally uses for multimodal
+        // slots) submits text and image embeddings interleaved in one embd batch. Models that
+        // require non-causal attention for their image tokens (e.g. some LLaVA variants) need
+        // the whole image in a single ubatch with causal attention disabled — that requirement
+        // is incompatible with coalescing arbitrary text/image runs. Refuse to start rather
+        // than risk producing silently-wrong outputs.
+        if (mtmd_decode_use_non_causal(mctx)) {
+            LLAMA_LOG_ERROR("%s: multimodal model requires non-causal attention for image tokens, "
+                            "which is not supported by the coalesced prefill path. Refusing to start.\n",
+                            __func__);
+            mtmd_free(mctx);
+            mctx = nullptr;
+            return false;
+        }
+        // Self-extend (group attention) remaps token positions during prefill. The deleted
+        // text-token loop honored slot.ga_n / ga_w / ga_i; the coalesced path's position
+        // assignment doesn't replicate that remapping. Refuse to start with both enabled.
+        if (params_base.grp_attn_n != 1) {
+            LLAMA_LOG_ERROR("%s: self-extend (--grp-attn-n != 1) is not supported alongside multimodal models "
+                            "by the coalesced prefill path. Refusing to start.\n",
+                            __func__);
+            mtmd_free(mctx);
+            mctx = nullptr;
+            return false;
+        }
+        // The coalesced prefill path inlines its own llama_decode per slot, while the shared
+        // batch (from text-token prefill across slots) is decoded once at the end of
+        // update_slots and would overwrite the coalesced slot's logits. Restricting to one
+        // slot makes the ordering trivial: shared batch is always empty or belongs to the
+        // single coalesced slot.
+        if (params_base.n_parallel > 1) {
+            LLAMA_LOG_ERROR("%s: multimodal models require --parallel 1 with this build. "
+                            "n_parallel=%d is unsupported alongside the coalesced prefill path.\n",
+                            __func__, params_base.n_parallel);
+            mtmd_free(mctx);
+            mctx = nullptr;
+            return false;
+        }
+
         //if (params.n_cache_reuse) {
         //    params_base.n_cache_reuse = 0;
         //    SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
@@ -3995,7 +4034,106 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     { "p0",      p0 }
                     });
 
-                // check if we should process the image
+                // === COALESCED MULTIMODAL PREFILL PATH ===
+                // When the server has a multimodal model loaded (mctx != nullptr), every slot
+                // takes the coalesced path: build one big embd buffer for all remaining text+
+                // media chunks, submit as a single embd batch (split internally by n_batch),
+                // sample the first generation token inline, and transition to PROCESSING.
+                //
+                // Requires --parallel 1 (enforced at startup) so the shared text-token batch
+                // is always empty for this tick and process_batch_tokens at the end of
+                // update_slots is a no-op — leaving our coalesced logits intact.
+                if (mctx != nullptr) {
+                    if (slot.n_past_prompt < slot.n_prompt_tokens) {
+                        size_t consumed = 0;
+                        llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past;
+
+                        server_mtp_warmup mtp_media_warmup {
+                            ctx,
+                            slot.has_mtp && slot.spec ? &slot : nullptr,
+                        };
+                        mtmd_helper_eval_batch_callback mtp_media_callback =
+                            mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
+
+                        int32_t res = slot.prompt_tokens.process_all_remaining_chunks_coalesced(
+                                ctx, mctx, slot.n_past_prompt, p1, slot.id, consumed,
+                                mtp_media_callback, &mtp_media_warmup);
+                        if (res != 0) {
+                            LLAMA_LOG_ERROR("coalesced prefill failed, res = %d\n", res);
+                            slot.release();
+                            send_error(slot, "coalesced prefill failed", ERROR_TYPE_SERVER);
+                            continue;
+                        }
+
+                        // Mirror the consumed tokens/chunks into cache_tokens, preserving
+                        // alternating text/media structure (use LLAMA_TOKEN_NULL placeholders
+                        // to find media boundaries).
+                        const size_t start_idx = slot.n_past_prompt;
+                        const size_t end_idx   = start_idx + consumed;
+                        for (size_t k = start_idx; k < end_idx; ) {
+                            llama_token tok = slot.prompt_tokens[k];
+                            if (tok == LLAMA_TOKEN_NULL) {
+                                const auto & chunk = slot.prompt_tokens.find_chunk(k);
+                                slot.cache_tokens.push_back(chunk.get());
+                                k += mtmd_input_chunk_get_n_tokens(chunk.get());
+                            } else {
+                                slot.cache_tokens.push_back(tok);
+                                k++;
+                            }
+                        }
+
+                        slot.n_past                    += consumed;
+                        slot.n_past_prompt             += consumed;
+                        slot.n_prompt_tokens_processed += consumed;
+                    }
+
+                    // Prefill complete (in one tick) — transition to generation and sample the
+                    // first token inline from the coalesced decode's logits.
+                    if (slot.n_past_prompt == slot.n_prompt_tokens) {
+                        slot.state   = SLOT_STATE_PROCESSING;
+                        slot.command = SLOT_COMMAND_NONE;
+                        GGML_ASSERT((size_t)slot.n_prompt_tokens == slot.prompt_tokens.size());
+
+                        common_sampler_reset(slot.ctx_sampling);
+                        for (int j = 0; j < slot.n_prompt_tokens; ++j) {
+                            llama_token id = slot.prompt_tokens[j];
+                            if (id != LLAMA_TOKEN_NULL) {
+                                common_sampler_accept(slot.ctx_sampling, ctx, id, false);
+                            }
+                        }
+
+                        slot.t_start_generation  = ggml_time_us();
+                        slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(slot);
+
+                        // logits_last=true was passed to mtmd_helper_eval_coalesced, so the
+                        // latest decode has exactly one logit output, at index 0.
+                        apply_server_biases(slot);
+                        llama_token first_tok = common_sampler_sample(slot.ctx_sampling, ctx, 0);
+                        common_sampler_accept(slot.ctx_sampling, ctx, first_tok, true);
+                        slot.n_decoded = 1;
+                        slot.sampled   = first_tok;
+
+                        completion_token_output result;
+                        result.tok          = first_tok;
+                        result.prob         = 1.0f;
+                        result.text_to_send = common_token_to_piece(ctx, result.tok,
+                                                                    accept_special_token(slot, result.tok));
+                        slot.token_buffer = { result };
+                        send_token_results(slot.token_buffer, slot);
+                        common_sampler_review(slot.ctx_sampling, slot.token_buffer.size(), slot.rewind_status);
+                        update_allowlist_state(slot);
+
+                        slot.i_batch = -1;
+                    }
+
+                    // Skip the legacy per-image branch and the text-token loop below.
+                    continue;
+                }
+
+                // === LEGACY NON-MTMD PREFILL PATH ===
+                // check if we should process the image (only fires if mctx is loaded, which
+                // we just ruled out — kept defensively, will never run)
                 if (slot.n_past_prompt < slot.n_prompt_tokens
                     && slot.prompt_tokens[slot.n_past_prompt] == LLAMA_TOKEN_NULL) {
                     // process the image

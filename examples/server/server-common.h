@@ -474,6 +474,22 @@ public:
         mtmd_helper_eval_batch_callback callback = nullptr,
         void * callback_user_data = nullptr) const;
 
+    // Process every remaining token+media from starting_token_idx onward as ONE coalesced
+    // embd batch (text rows via the input-embedding LUT, image/audio rows via mtmd_encode).
+    // Walks tokens + map_idx_to_media to build text/media descriptors, then dispatches via
+    // mtmd_helper_eval_coalesced.
+    // Returns 0 on success; n_tokens_out is the total slot count processed (so callers can
+    // advance slot.n_past / slot.n_past_prompt by this amount).
+    int32_t process_all_remaining_chunks_coalesced(
+        llama_context* ctx,
+        mtmd_context* mctx,
+        size_t starting_token_idx,
+        llama_pos pos,
+        int32_t seq_id,
+        size_t& n_tokens_out,
+        mtmd_helper_eval_batch_callback callback = nullptr,
+        void * callback_user_data = nullptr) const;
+
     server_tokens clone() const;
 
     // Keep the first n_keep and remove n_discard tokens from tokens

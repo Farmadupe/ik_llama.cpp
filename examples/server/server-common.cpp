@@ -1718,6 +1718,76 @@ int32_t server_tokens::process_chunk(
     return 0;
 }
 
+int32_t server_tokens::process_all_remaining_chunks_coalesced(
+    llama_context* ctx,
+    mtmd_context* mctx,
+    size_t starting_token_idx,
+    llama_pos pos,
+    int32_t seq_id,
+    size_t& n_tokens_out,
+    mtmd_helper_eval_batch_callback callback,
+    void * callback_user_data) const {
+    if (starting_token_idx >= tokens.size()) {
+        n_tokens_out = 0;
+        return 0;
+    }
+
+    // Walk tokens + map_idx_to_media to build a flat list of text/media descriptors.
+    // Consecutive text positions collapse into a single text run; each media chunk is one descriptor.
+    std::vector<mtmd_helper_coalesce_input> descriptors;
+    descriptors.reserve(map_idx_to_media.size() * 2 + 1);
+
+    size_t idx = starting_token_idx;
+    while (idx < tokens.size()) {
+        auto media_it = map_idx_to_media.find(idx);
+        if (media_it != map_idx_to_media.end()) {
+            const mtmd_input_chunk * chunk = media_it->second.get();
+            mtmd_helper_coalesce_input desc{};
+            desc.is_text       = false;
+            desc.text_tokens   = nullptr;
+            desc.n_text_tokens = 0;
+            desc.chunk         = chunk;
+            descriptors.push_back(desc);
+            idx += mtmd_input_chunk_get_n_tokens(chunk);
+        } else {
+            // text run: spans from idx up to (but not including) the next media boundary.
+            auto next_media = map_idx_to_media.lower_bound(idx);
+            const size_t text_end = (next_media != map_idx_to_media.end()) ? next_media->first : tokens.size();
+            mtmd_helper_coalesce_input desc{};
+            desc.is_text       = true;
+            desc.text_tokens   = tokens.data() + idx;
+            desc.n_text_tokens = (int32_t)(text_end - idx);
+            desc.chunk         = nullptr;
+            descriptors.push_back(desc);
+            idx = text_end;
+        }
+    }
+
+    const int32_t n_batch = llama_n_batch(ctx);
+    const int64_t t0       = ggml_time_ms();
+    llama_pos new_n_past   = pos;
+
+    int32_t result = mtmd_helper_eval_coalesced(
+        mctx, ctx,
+        descriptors.data(), descriptors.size(),
+        pos, seq_id, n_batch,
+        /*logits_last=*/ true,
+        &new_n_past,
+        callback, callback_user_data);
+
+    LLAMA_LOG_INFO("coalesced prefill (%zu inputs, %zu slots) processed in %" PRId64 " ms\n",
+                   descriptors.size(), idx - starting_token_idx, ggml_time_ms() - t0);
+
+    if (result != 0) {
+        LLAMA_LOG_ERROR("mtmd_helper_eval_coalesced failed with status %d\n", result);
+        n_tokens_out = 0;
+        return result;
+    }
+
+    n_tokens_out = idx - starting_token_idx;
+    return 0;
+}
+
 server_tokens server_tokens::clone() const {
     server_tokens res;
     res.has_mtmd = has_mtmd;
