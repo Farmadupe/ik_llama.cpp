@@ -1,14 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = "==3.14.*"
-# dependencies = [
-#     "pytest~=8.4",
-#     "openai~=1.60",
-#     "Pillow~=11.0",
-#     "huggingface_hub~=0.27.0",
-#     "requests~=2.32",
-# ]
-# ///
 """Smoke tests for the coalesced multimodal prefill path in llama-server."""
 
 from __future__ import annotations
@@ -16,7 +5,6 @@ from __future__ import annotations
 import base64
 import io
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -261,7 +249,3 @@ def test_prompt_cache_rewind(client):
 
     assert "square" in out_b.lower(), f"stale or wrong answer: {out_b!r}"
     assert t_warm < t_cold * 0.7, f"expected partial-prefix reuse: cold={t_cold:.2f}s warm={t_warm:.2f}s"
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"] + sys.argv[1:]))

@@ -33,7 +33,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
-#define LOG_INF(...) fprintf(stdout, __VA_ARGS__)
+// stderr (unbuffered) so progress lines stream live when stdout is piped/redirected;
+// matches LOG_ERR and the rest of llama.cpp's logging conventions.
+#define LOG_INF(...) fprintf(stderr, __VA_ARGS__)
 #define LOG_ERR(...) fprintf(stderr, __VA_ARGS__)
 
 size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks) {
@@ -548,9 +550,11 @@ int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
         const int     tokens_done = pos_offset + n_tokens_view;
         const int     pct         = (int)((int64_t) tokens_done * 100 / n_total_tokens);
         const double  rate_tps    = (double) s_total_tokens / ((double) s_total_time_us / 1.0e6 + 1e-9);
+        const double  batch_tps   = (double) n_tokens_view / ((double) t_sub_us / 1.0e6 + 1e-9);
         const int64_t eta_sec     = (int64_t)((n_total_tokens - tokens_done) / std::max(rate_tps, 1.0));
-        LOG_INF("coalesced prefill (%d tokens, %d%%) eta: %02d:%02d -- processed in %d ms\n",
-                tokens_done, pct, (int)(eta_sec / 60), (int)(eta_sec % 60), (int)(t_sub_us / 1000));
+        LOG_INF("coalesced prefill (%d tokens, %d%%) eta: %02d:%02d -- batch: %d tok in %d ms (%.1f tok/s) -- avg %.1f tok/s\n",
+                tokens_done, pct, (int)(eta_sec / 60), (int)(eta_sec % 60),
+                n_tokens_view, (int)(t_sub_us / 1000), batch_tps, rate_tps);
 
         if (callback) {
             int32_t cb_ret = callback(callback_user_data, &view);
