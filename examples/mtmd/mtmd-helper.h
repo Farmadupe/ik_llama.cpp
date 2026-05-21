@@ -59,6 +59,39 @@ MTMD_API int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
                                          bool logits_last,
                                          llama_pos * new_n_past);
 
+// Input descriptor for the coalesced eval helper. Either a run of raw text tokens
+// (we'll look up their embeddings via the model's input-embedding LUT) or a single
+// media chunk (we'll run the vision/audio encoder via mtmd_encode_chunk).
+struct mtmd_helper_coalesce_input {
+    bool                     is_text;        // true: text run; false: media chunk
+    // text fields (valid iff is_text == true):
+    const llama_token *      text_tokens;
+    int32_t                  n_text_tokens;
+    // media field (valid iff is_text == false):
+    const mtmd_input_chunk * chunk;
+};
+
+// Coalesced eval: builds ONE contiguous embedding buffer for the entire input
+// (text rows from the model's input-embedding LUT, image/audio rows from mtmd_encode_chunk)
+// and submits it via a single embd-batch llama_decode, split internally by n_batch.
+//
+// Use this to avoid the degenerate 2N+1 tiny batches you get from per-chunk dispatch when
+// a prompt contains many small images. Does NOT support non-causal-attention models - caller
+// must check mtmd_decode_use_non_causal(ctx) and reject up front.
+//
+// this function is NOT thread-safe
+MTMD_API int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
+                                            struct llama_context * lctx,
+                                            const struct mtmd_helper_coalesce_input * inputs,
+                                            size_t n_inputs,
+                                            llama_pos n_past,
+                                            llama_seq_id seq_id,
+                                            int32_t n_batch,
+                                            bool logits_last,
+                                            llama_pos * new_n_past,
+                                            mtmd_helper_eval_batch_callback callback,
+                                            void * callback_user_data);
+
 // works like mtmd_helper_eval_chunks(), but only for a single chunk
 // this function is NOT thread-safe
 MTMD_API int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
