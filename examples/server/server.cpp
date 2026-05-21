@@ -1089,6 +1089,7 @@ int main(int argc, char ** argv) {
                     // Everything else, including multimodal completions.
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
+                g_t_post_tokenize_us.store(ggml_time_us());
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);
@@ -1287,6 +1288,7 @@ int main(int argc, char ** argv) {
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        g_t_post_template_us.store(ggml_time_us());
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,

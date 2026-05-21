@@ -1222,6 +1222,7 @@ int32_t server_context::populate_vocab_pieces() {
 }
 
 bool server_context::launch_slot_with_task(server_slot& slot, server_task& task) {
+    g_t_slot_launch_us.store(ggml_time_us());
     slot_params defaults;
     defaults.speculative = params_base.speculative;
 
@@ -4051,10 +4052,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     mtmd_helper_eval_batch_callback mtp_media_callback =
                         mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
 
-                    if (int64_t t_recv = g_t_request_received_us.exchange(0)) {
-                        fprintf(stderr, "preprocess: recv->decode %" PRId64 " ms\n",
-                                (ggml_time_us() - t_recv) / 1000);
-                    }
+                    preprocess_print_stages_if_armed();
 
                     int32_t res = slot.prompt_tokens.process_chunks_coalesced(
                             ctx, mctx, slot.n_past_prompt, slot.n_prompt_tokens - 1,
@@ -4762,10 +4760,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
-        if (int64_t t_recv = g_t_request_received_us.exchange(0)) {
-            fprintf(stderr, "preprocess: recv->decode %" PRId64 " ms\n",
-                    (ggml_time_us() - t_recv) / 1000);
-        }
+        preprocess_print_stages_if_armed();
 
         const int ret = llama_decode(ctx, batch_view);
         if (ret != 0) {

@@ -16,11 +16,36 @@
 #include <cinttypes>
 #include <deque>
 
-// Wall-clock us at which the most recent HTTP request body was received (set in log_prompt).
-// Read+cleared right before the first llama_decode of a fresh prompt to print the
-// preprocessing gap (Jinja + tokenize + queue + cache lookup + any media encode).
-// Single-request granularity; relies on coalesced/multimodal path's n_parallel=1 invariant.
-inline std::atomic<int64_t> g_t_request_received_us{0};
+// ---- Temporary preprocessing-stage timing instrumentation ----
+// File-scope globals so they're trivial to grep+delete when done debugging.
+// All four are wall-clock us, all reset to 0 after one print. Single-request
+// granularity; relies on coalesced/multimodal path's n_parallel=1 invariant.
+inline std::atomic<int64_t> g_t_request_received_us{0};  // set in log_prompt (HTTP body in)
+inline std::atomic<int64_t> g_t_post_template_us{0};     // set after oaicompat_chat_params_parse (Jinja done)
+inline std::atomic<int64_t> g_t_post_tokenize_us{0};     // set after tokenize_input_prompts / process_mtmd_prompt
+inline std::atomic<int64_t> g_t_slot_launch_us{0};       // set at top of launch_slot_with_task (slot picked up)
+
+inline void preprocess_print_stages_if_armed() {
+    int64_t t_recv = g_t_request_received_us.exchange(0);
+    if (!t_recv) return;
+    int64_t t_tmpl   = g_t_post_template_us.exchange(0);
+    int64_t t_tok    = g_t_post_tokenize_us.exchange(0);
+    int64_t t_launch = g_t_slot_launch_us.exchange(0);
+    int64_t t_decode = ggml_time_us();
+    auto sec = [](int64_t a, int64_t b) { return (double)(b - a) / 1.0e6; };
+    // Format: name field is 39 chars wide (left-justified), number starts at column 40,
+    // 8-wide right-justified with 2 decimals so decimal points align across all rows.
+    fprintf(stderr, "preprocess timing:\n");
+    if (t_tmpl) {
+        fprintf(stderr, "%-39s%8.2f s\n", "* parse json + jinja:",            sec(t_recv,   t_tmpl));
+        fprintf(stderr, "%-39s%8.2f s\n", "* decode images and split inputs:", sec(t_tmpl,   t_tok));
+    } else {
+        fprintf(stderr, "%-39s%8.2f s\n", "* decode images and split inputs:", sec(t_recv,   t_tok));
+    }
+    fprintf(stderr,     "%-39s%8.2f s\n", "* queue + slot select:",           sec(t_tok,    t_launch));
+    fprintf(stderr,     "%-39s%8.2f s\n", "* prompt cache + batch prep:",     sec(t_launch, t_decode));
+    fprintf(stderr,     "%-39s%8.2f s\n", "* total preprocessing time:",      sec(t_recv,   t_decode));
+}
 
 
 
