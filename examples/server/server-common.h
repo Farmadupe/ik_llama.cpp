@@ -478,6 +478,23 @@ public:
         mtmd_helper_eval_batch_callback callback = nullptr,
         void * callback_user_data = nullptr) const;
 
+    // Coalesced prefill: evaluates the token range [start_token_idx, end_token_idx) as
+    // ONE embd batch (text rows via the input-embedding LUT, image/audio rows via
+    // mtmd_encode). Side-channel llama_decode call, mirroring the existing per-image
+    // pattern but with a bigger payload.
+    // Returns 0 on success; n_tokens_out is the slot count consumed (caller advances
+    // slot.n_past / slot.n_past_prompt by this amount).
+    int32_t process_chunks_coalesced(
+        llama_context* ctx,
+        mtmd_context* mctx,
+        size_t start_token_idx,
+        size_t end_token_idx,
+        llama_pos pos,
+        int32_t seq_id,
+        size_t& n_tokens_out,
+        mtmd_helper_eval_batch_callback callback = nullptr,
+        void * callback_user_data = nullptr) const;
+
     server_tokens clone() const;
 
     // Keep the first n_keep and remove n_discard tokens from tokens

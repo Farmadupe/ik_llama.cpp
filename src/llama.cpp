@@ -10017,6 +10017,100 @@ float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id
     return it->second.data();
 }
 
+int32_t llama_input_embeddings(
+        struct llama_context * ctx,
+        const llama_token   * tokens,
+        int32_t               n_tokens,
+        float               * out,
+        int32_t               out_stride) {
+    if (ctx == nullptr || tokens == nullptr || out == nullptr || n_tokens <= 0) {
+        LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
+        return -1;
+    }
+
+    const llama_model & model = ctx->model;
+
+    if (model.tok_embd == nullptr) {
+        LLAMA_LOG_ERROR("%s: model has no token embedding table\n", __func__);
+        return -1;
+    }
+
+    // Width of one tok_embd row. May be narrower than hparams.n_embd for architectures
+    // whose batch.embd layout concatenates extra per-layer slices alongside the base
+    // embedding (see e.g. build_qwen3.cpp); the trailing slots get zero-padded below.
+    const int64_t n_embd = model.tok_embd->ne[0];
+
+    if (out_stride < (int32_t) n_embd) {
+        LLAMA_LOG_ERROR("%s: out_stride (%d) < tok_embd width (%lld)\n",
+                        __func__, out_stride, (long long) n_embd);
+        return -1;
+    }
+
+    // Make sure any in-flight async work on the scheduler is done before we reset it.
+    llama_synchronize(ctx);
+
+    // Build a tiny graph: out = ggml_get_rows(tok_embd, ids)
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx0 = ggml_init(params);
+    if (ctx0 == nullptr) {
+        LLAMA_LOG_ERROR("%s: ggml_init failed\n", __func__);
+        return -1;
+    }
+
+    ggml_tensor * ids_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(ids_tensor, "input_embd_ids");
+    ggml_set_input(ids_tensor);
+
+    ggml_tensor * out_tensor = ggml_get_rows(ctx0, model.tok_embd, ids_tensor);
+    ggml_set_name(out_tensor, "input_embd_out");
+    ggml_set_output(out_tensor);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, /*size=*/ 8, /*grads=*/ false);
+    ggml_build_forward_expand(gf, out_tensor);
+
+    // Schedule and execute on the context's backend scheduler. This invalidates the
+    // cached worst-case graph, so the next llama_decode will pay one reservation.
+    ctx->reset_scheduler();
+
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        LLAMA_LOG_ERROR("%s: ggml_backend_sched_alloc_graph failed\n", __func__);
+        ggml_free(ctx0);
+        return -1;
+    }
+
+    // Upload token IDs into the input tensor's allocated backend buffer.
+    ggml_backend_tensor_set(ids_tensor, tokens, 0, n_tokens * sizeof(llama_token));
+
+    llama_graph_compute(*ctx, gf, ctx->cparams.n_threads);
+
+    // ggml_backend_tensor_get is synchronous, so this blocks until the compute finishes.
+    if (out_stride == (int32_t) n_embd) {
+        // Tight packing - single contiguous copy.
+        ggml_backend_tensor_get(out_tensor, out, 0, n_tokens * n_embd * sizeof(float));
+    } else {
+        // Strided output: get rows into a temporary tight buffer, then scatter into the
+        // caller's buffer with the requested stride and zero-padded trailing slots.
+        std::vector<float> tmp((size_t) n_tokens * n_embd);
+        ggml_backend_tensor_get(out_tensor, tmp.data(), 0, n_tokens * n_embd * sizeof(float));
+        const size_t pad_floats = (size_t) out_stride - (size_t) n_embd;
+        for (int32_t i = 0; i < n_tokens; i++) {
+            float * row = out + (size_t) i * out_stride;
+            std::memcpy(row, tmp.data() + (size_t) i * n_embd, n_embd * sizeof(float));
+            if (pad_floats > 0) {
+                std::memset(row + n_embd, 0, pad_floats * sizeof(float));
+            }
+        }
+    }
+
+    ggml_free(ctx0);
+    return 0;
+}
+
 //
 // vocab
 //
