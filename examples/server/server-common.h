@@ -10,10 +10,17 @@
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <cinttypes>
 #include <deque>
+
+// Wall-clock us at which the most recent HTTP request body was received (set in log_prompt).
+// Read+cleared right before the first llama_decode of a fresh prompt to print the
+// preprocessing gap (Jinja + tokenize + queue + cache lookup + any media encode).
+// Single-request granularity; relies on coalesced/multimodal path's n_parallel=1 invariant.
+inline std::atomic<int64_t> g_t_request_received_us{0};
 
 
 
