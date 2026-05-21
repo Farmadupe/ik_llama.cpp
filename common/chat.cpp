@@ -790,6 +790,16 @@ static std::string common_chat_template_direct_apply_impl(
     if (tmpl.source().find("<|pangu_text_start|>") != std::string::npos) {
         inp["thinking"] = inputs.enable_thinking;
     }
+    // MiniMax-M3 gates reasoning on a `thinking_mode` variable ("enabled" / "disabled" /
+    // "adaptive", defaulting to adaptive when undefined) rather than `enable_thinking`.
+    // Bridge only the disable direction: `enable_thinking=true` keeps the template's
+    // adaptive default instead of forcing thinking on. An explicit `thinking_mode`
+    // chat_template_kwarg still wins (merged via extra_context below).
+    if (!inputs.enable_thinking &&
+        tmpl.source().find("]<]minimax[>[") != std::string::npos &&
+        tmpl.source().find("thinking_mode") != std::string::npos) {
+        inp["thinking_mode"] = "disabled";
+    }
     if (tools_override.has_value() || !inputs.tools.empty()) {
         inp["tools"] = tools_override.has_value() ? *tools_override : inputs.tools;
     }
@@ -2069,6 +2079,11 @@ static common_chat_params common_chat_params_init_minimax_m3(const common_chat_t
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
 
+    const auto last_think_start = inputs.generation_prompt.rfind(THINK_START);
+    const auto last_think_end   = inputs.generation_prompt.rfind(THINK_END);
+    const bool thinking_closed  = last_think_end != std::string::npos &&
+                                  (last_think_start == std::string::npos || last_think_start < last_think_end);
+
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);
         auto end = p.end();
@@ -2087,21 +2102,31 @@ static common_chat_params common_chat_params_init_minimax_m3(const common_chat_t
             auto opened = p.literal(THINK_START) +
                           p.reasoning(thinking_body()) +
                           p.optional(p.literal(THINK_END));
-            auto unopened = p.reasoning(thinking_body()) + p.literal(THINK_END);
-            reasoning = p.optional(p.choice({ opened, unopened }));
+            if (thinking_closed) {
+                // The think block was already closed in the generation prompt:
+                // the completion is content unless the model reopens <mm:think>.
+                reasoning = p.optional(opened);
+            } else {
+                auto unopened = p.reasoning(thinking_body()) + p.literal(THINK_END);
+                reasoning = p.optional(p.choice({ opened, unopened }));
 
-            if (inputs.enable_thinking) {
-                // During streaming, the closing tag may not have arrived yet; if
-                // a tool call starts first, stop reasoning at the tool marker.
-                auto partial = p.reasoning(thinking_body());
-                reasoning = p.optional(p.choice({ opened, unopened, partial }));
+                if (inputs.enable_thinking) {
+                    // During streaming, the closing tag may not have arrived yet; if
+                    // a tool call starts first, stop reasoning at the tool marker.
+                    auto partial = p.reasoning(thinking_body());
+                    reasoning = p.optional(p.choice({ opened, unopened, partial }));
+                }
             }
         } else if (inputs.enable_thinking) {
             auto opened = p.content(p.literal(THINK_START) +
                                     thinking_body() +
                                     p.optional(p.literal(THINK_END)));
-            auto unopened = p.content(thinking_body()) + p.literal(THINK_END);
-            reasoning = p.optional(p.choice({ opened, unopened }));
+            if (thinking_closed) {
+                reasoning = p.optional(opened);
+            } else {
+                auto unopened = p.content(thinking_body()) + p.literal(THINK_END);
+                reasoning = p.optional(p.choice({ opened, unopened }));
+            }
         }
 
         if (has_response_format) {
@@ -2731,12 +2756,16 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         workaround::func_args_not_string(params.messages);
     }
 
-    params.generation_prompt = common_chat_templates_generation_prompt(tmpl, params);
-
     params.extra_context = common_chat_extra_context();
     for (auto el : inputs.chat_template_kwargs) {
         params.extra_context[el.first] = json::parse(el.second);
     }
+
+    // Compute the generation prompt only after chat_template_kwargs are merged:
+    // kwargs like MiniMax-M3's `thinking_mode` change what the template appends
+    // after the last message (e.g. a prefilled </mm:think>), and the parsers
+    // key their reasoning handling off that suffix.
+    params.generation_prompt = common_chat_templates_generation_prompt(tmpl, params);
 
     if (!inputs.json_schema.empty()) {
         params.json_schema = json::parse(inputs.json_schema);

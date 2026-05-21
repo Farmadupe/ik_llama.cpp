@@ -244,6 +244,28 @@ bool server_context::load_model(const gpt_params& params_) {
         }
         LOG_INFO("loaded multimodal model, %s\n", mmproj_path.c_str());
 
+        // Models that use non-causal attention for iamges in the LM decoder (Gemma3, Gemma4)
+        // need one-batch-per-image. 
+        // The coalesced prefill path does not guarantee this
+        if (mtmd_decode_use_non_causal(mctx)) {
+            LLAMA_LOG_ERROR("%s: multimodal model requires non-causal attention for image tokens, "
+                            "which is not supported by the coalesced prefill path. Refusing to start.\n",
+                            __func__);
+            mtmd_free(mctx);
+            mctx = nullptr;
+            return false;
+        }
+        // Self-extend (group attention) remaps token positions during prefill. The deleted
+        // text-token loop honored slot.ga_n / ga_w / ga_i; the coalesced path's position
+        // assignment doesn't replicate that remapping. Refuse to start with both enabled.
+        if (params_base.grp_attn_n != 1) {
+            LLAMA_LOG_ERROR("%s: self-extend (--grp-attn-n != 1) is not supported alongside multimodal models "
+                            "by the coalesced prefill path. Refusing to start.\n",
+                            __func__);
+            mtmd_free(mctx);
+            mctx = nullptr;
+            return false;
+        }
         //if (params.n_cache_reuse) {
         //    params_base.n_cache_reuse = 0;
         //    SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
@@ -4093,6 +4115,53 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     { "id_task", slot.id_task },
                     { "p0",      p0 }
                     });
+
+                // Coalesced multimodal prefill (drop-in for the per-image side-channel below):
+                // evaluate every remaining prefill position EXCEPT the last one in a single
+                // embd-batch llama_decode. The last text token (guaranteed by chat templates)
+                // falls through to the standard text-token loop, which keeps server::batch
+                // non-empty so the standard post-prefill block + post-decode sampling fire
+                // unchanged.
+                if (mctx != nullptr && slot.n_past_prompt + 1 < slot.n_prompt_tokens) {
+                    size_t consumed = 0;
+                    llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past;
+
+                    server_mtp_warmup mtp_media_warmup {
+                        ctx,
+                        slot.uses_mtp() && slot.spec ? &slot : nullptr,
+                    };
+                    mtmd_helper_eval_batch_callback mtp_media_callback =
+                        mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
+
+                    int32_t res = slot.prompt_tokens.process_chunks_coalesced(
+                            ctx, mctx, slot.n_past_prompt, slot.n_prompt_tokens - 1,
+                            p1, slot.id, consumed,
+                            mtp_media_callback, &mtp_media_warmup);
+                    if (res != 0) {
+                        LLAMA_LOG_ERROR("coalesced prefill failed, res = %d\n", res);
+                        slot.release();
+                        send_error(slot, "coalesced prefill failed", ERROR_TYPE_SERVER);
+                        continue;
+                    }
+
+                    // Mirror consumed tokens/chunks into cache_tokens.
+                    for (size_t k = slot.n_past_prompt; k < slot.n_past_prompt + consumed; ) {
+                        llama_token tok = slot.prompt_tokens[k];
+                        if (tok == LLAMA_TOKEN_NULL) {
+                            slot.prompt_tokens.free_raw_media_data(k);
+                            const auto & chunk = slot.prompt_tokens.find_chunk(k);
+                            slot.cache_tokens.push_back(chunk.get());
+                            k += mtmd_input_chunk_get_n_tokens(chunk.get());
+                        } else {
+                            slot.cache_tokens.push_back(tok);
+                            k++;
+                        }
+                    }
+
+                    slot.n_past                    += consumed;
+                    slot.n_past_prompt             += consumed;
+                    slot.n_prompt_tokens_processed += consumed;
+                }
 
                 // check if we should process the image
                 if (slot.n_past_prompt < slot.n_prompt_tokens
