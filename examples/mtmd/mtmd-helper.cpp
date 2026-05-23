@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -543,11 +544,12 @@ int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
         const int     tokens_done = pos_offset + n_tokens_view;
         const int     pct         = (int)((int64_t) tokens_done * 100 / n_total_tokens);
         const double  batch_tps   = (double) n_tokens_view / ((double) t_sub_us / 1.0e6 + 1e-9);
-        // ETA derived from just-completed batch's rate — noisy on the first line, no smoothing.
-        const int64_t eta_sec     = (int64_t)((n_total_tokens - tokens_done) / std::max(batch_tps, 1.0));
-        LOG_INF("coalesced prefill (%d tokens, %d%%) eta: %02d:%02d -- batch: %d tok in %d ms (%.1f tok/s)\n",
-                tokens_done, pct, (int)(eta_sec / 60), (int)(eta_sec % 60),
-                n_tokens_view, (int)(t_sub_us / 1000), batch_tps);
+        const double  eta_rate_tps = 250.0;
+        const double  eta_sec      = (double)(n_total_tokens - tokens_done) / eta_rate_tps;
+        const int     batch_sec    = (int) std::llround((double) t_sub_us / 1.0e6);
+        LOG_INF("coalesced prefill (%d tokens, %d%%) eta: %02d:%02d -- batch: %d tok in %d s (%.1f tok/s)\n",
+                tokens_done, pct, (int)(eta_sec / 60.0), (int) std::fmod(eta_sec, 60.0),
+                n_tokens_view, batch_sec, batch_tps);
 
         if (callback) {
             int32_t cb_ret = callback(callback_user_data, &view);

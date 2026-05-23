@@ -4056,6 +4056,10 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                     preprocess_print_stages_if_armed();
 
+                    fprintf(stderr, "prompt tokens: %d total. %d prefill\n",
+                            (int) slot.n_prompt_tokens,
+                            (int) (slot.n_prompt_tokens - slot.n_past_prompt));
+
                     int32_t res = slot.prompt_tokens.process_chunks_coalesced(
                             ctx, mctx, slot.n_past_prompt, slot.n_prompt_tokens - 1,
                             p1, slot.id, consumed,
