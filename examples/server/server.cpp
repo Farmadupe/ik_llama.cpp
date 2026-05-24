@@ -1091,6 +1091,26 @@ int main(int argc, char ** argv) {
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
                 g_t_post_tokenize_us.store(ggml_time_us());
+
+                // Reject oversize prompts at HTTP entry so we don't waste forward passes
+                // on a request that the slot layer would either truncate (ctx_shift) or
+                // crash on at decode time. Mirrors the late check at server-context.cpp:3857.
+                if (type == SERVER_TASK_TYPE_COMPLETION) {
+                    const int32_t n_ctx_slot = ctx_server.n_ctx / ctx_server.params_base.n_parallel;
+                    for (const auto & inp : inputs) {
+                        if (inp.n_tokens() >= n_ctx_slot) {
+                            // Disarm the preprocess-timing print before leaving so a later
+                            // update_slots() from a different in-flight request can't consume
+                            // this rejected request's stale checkpoints.
+                            g_t_request_received_us.store(0);
+                            res_err(res, format_error_response(
+                                "the request exceeds the available context size, try increasing it",
+                                ERROR_TYPE_INVALID_REQUEST));
+                            return;
+                        }
+                    }
+                }
+
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);
