@@ -1112,6 +1112,24 @@ int main(int argc, char ** argv) {
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true, trace.get());
                 }
                 if (trace) trace->mark_post_tokenize();
+
+                // Reject oversize prompts at HTTP entry so we don't waste forward passes
+                // on a request that the slot layer would either truncate (ctx_shift) or
+                // crash on at decode time. Mirrors the late check at server-context.cpp:3857.
+                if (type == SERVER_TASK_TYPE_COMPLETION) {
+                    const int32_t n_ctx_slot = ctx_server.n_ctx / ctx_server.params_base.n_parallel;
+                    for (const auto & inp : inputs) {
+                        if (inp.n_tokens() >= n_ctx_slot) {
+                            // No disarm needed: the trace is referenced only by this
+                            // handler's local; returning drops it before any task is
+                            // built, so nothing is ever printed for the rejected request.
+                            res_err(res, format_error_response(
+                                "the request exceeds the available context size, try increasing it",
+                                ERROR_TYPE_INVALID_REQUEST));
+                            return;
+                        }
+                    }
+                }
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);
