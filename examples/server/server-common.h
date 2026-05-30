@@ -489,6 +489,11 @@ public:
 
     const mtmd::input_chunk_ptr& find_chunk(size_t idx) const;
 
+    // non-throwing: true if idx is the *start* index of a media (image/audio) chunk.
+    // A valid prefix/keep boundary is either a text token or a chunk start; an index
+    // whose token is LLAMA_TOKEN_NULL but is not a chunk start lies *inside* an image.
+    bool is_chunk_start(size_t idx) const;
+
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data

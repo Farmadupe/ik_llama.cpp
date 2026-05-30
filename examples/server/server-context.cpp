@@ -3997,6 +3997,34 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 {
                     slot.n_past = 0;
                 }
+
+                // --- prefix-cache consistency tripwire (permanent diagnostic) -------------
+                // A legitimate common prefix can NEVER end inside an image: images are
+                // matched atomically (same id + n_tokens, advancing by the whole span) or
+                // not at all, so n_past must land on a text token or a chunk boundary.
+                // If cache_tokens[n_past-1] is an image token (LLAMA_TOKEN_NULL) that is not
+                // a chunk start, then n_past was mis-counted upstream (see get_common_prefix
+                // / the non-exact override in this function). That is exactly the case that
+                // makes keep_first() -> find_chunk() throw and abort the whole server. Log
+                // loudly with the derivation context right before it blows up, so a hit in
+                // production leaves a trail instead of a bare std::terminate.
+                if (slot.n_past > 0 && (size_t) slot.n_past <= slot.cache_tokens.size()
+                        && slot.cache_tokens[slot.n_past - 1] == LLAMA_TOKEN_NULL
+                        && !slot.cache_tokens.is_chunk_start(slot.n_past - 1)) {
+                    LLAMA_LOG_ERROR(
+                        "[prefix-cache BUG] n_past=%d lands INSIDE an image chunk "
+                        "(cache_tokens[%d] is a non-start image token); keep_first() is about "
+                        "to throw and abort the server. This is an upstream prefix-count bug, "
+                        "not a real mid-image divergence. "
+                        "n_past_prompt=%d n_past_offset=%d cache_size=%d n_prompt_tokens=%d "
+                        "id_slot=%d id_task=%d\n",
+                        (int) slot.n_past, (int) slot.n_past - 1,
+                        (int) slot.n_past_prompt, (int) slot.n_past_offset,
+                        (int) slot.cache_tokens.size(), (int) slot.n_prompt_tokens,
+                        slot.id, slot.id_task);
+                }
+                // -------------------------------------------------------------------------
+
                 slot.cache_tokens.keep_first(slot.n_past);
                 int p0 = (int)system_tokens.size() + slot.n_past;
                 p0 = system_tokens.size() + slot.cache_tokens.pos_next();

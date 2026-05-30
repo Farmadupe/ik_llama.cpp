@@ -1257,6 +1257,10 @@ const mtmd::input_chunk_ptr& server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
+bool server_tokens::is_chunk_start(size_t idx) const {
+    return map_idx_to_media.find(idx) != map_idx_to_media.end();
+}
+
 void server_tokens::push_back(llama_token tok) {
     if (tok == LLAMA_TOKEN_NULL) {
         throw std::runtime_error("Invalid token");

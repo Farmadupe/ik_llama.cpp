@@ -249,3 +249,86 @@ def test_prompt_cache_rewind(client):
 
     assert "square" in out_b.lower(), f"stale or wrong answer: {out_b!r}"
     assert t_warm < t_cold * 0.7, f"expected partial-prefix reuse: cold={t_cold:.2f}s warm={t_warm:.2f}s"
+
+
+def test_image_prefix_fewer_images(client):
+    """First prompt: two images. Second prompt: an image-only prefix of the first
+    (just the first image), with no text portions in either. Exercises the case where
+    a later request is a strict image-only prefix of an earlier one."""
+    img1 = red_square_on_white()
+    img2 = blue_triangle_on_black()
+
+    out_full = chat(client, [
+        {"type": "image_url", "image_url": {"url": img1}},
+        {"type": "image_url", "image_url": {"url": img2}},
+        {"type": "text", "text": "Hello, World!"},
+    ], max_tokens=400)
+    assert out_full.strip(), "empty reply for two-image prompt"
+
+    out_prefix = chat(client, [
+        {"type": "image_url", "image_url": {"url": img1}},
+        {"type": "text", "text": "Hello, World!"},
+    ], max_tokens=200)
+    assert out_prefix.strip(), "empty reply for single-image prefix prompt"
+
+
+def _img(url):
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _txt(t):
+    return {"type": "text", "text": t}
+
+
+# Hunting a prefix-cache counting bug: when a follow-up request drops or swaps an
+# image relative to a cached prompt, the computed common prefix (n_past) must never
+# land inside an image chunk. Each case sends a "first" prompt, then a "second" that
+# shares an image-bearing prefix with it. Distinct colours per case keep chunk ids
+# from colliding across cases (the server/cache is shared for the whole session).
+# A mid-image n_past trips the [prefix-cache BUG] tripwire and aborts the server, so
+# the post-request liveness check is the signal. Both with- and without-trailing-text
+# variants are included: the no-text ones end the user turn right after an image.
+_IMG_REMOVAL_CASES = {
+    "remove_second_no_text": (
+        [_img(colored_square("red")), _img(colored_square("lime"))],
+        [_img(colored_square("red"))],
+    ),
+    "remove_second_with_text": (
+        [_img(colored_square("blue")), _img(colored_square("orange")), _txt("Hello, World!")],
+        [_img(colored_square("blue")), _txt("Hello, World!")],
+    ),
+    "remove_first_no_text": (
+        [_img(colored_square("purple")), _img(colored_square("cyan"))],
+        [_img(colored_square("cyan"))],
+    ),
+    "replace_second_no_text": (
+        [_img(colored_square("yellow")), _img(colored_square("magenta"))],
+        [_img(colored_square("yellow")), _img(colored_square("green"))],
+    ),
+    "three_remove_middle_no_text": (
+        [_img(colored_square("red", bg="black")),
+         _img(colored_square("blue", bg="black")),
+         _img(colored_square("green", bg="black"))],
+        [_img(colored_square("red", bg="black")),
+         _img(colored_square("green", bg="black"))],
+    ),
+    "three_remove_last_no_text": (
+        [_img(colored_square("cyan", bg="black")),
+         _img(colored_square("yellow", bg="black")),
+         _img(colored_square("magenta", bg="black"))],
+        [_img(colored_square("cyan", bg="black")),
+         _img(colored_square("yellow", bg="black"))],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_IMG_REMOVAL_CASES))
+def test_image_removal_prefix_cache(client, case):
+    first, second = _IMG_REMOVAL_CASES[case]
+    out1 = chat(client, first, max_tokens=64)
+    _require_alive()
+    assert out1.strip(), f"{case}: empty reply to first prompt"
+
+    out2 = chat(client, second, max_tokens=64)
+    _require_alive()
+    assert out2.strip(), f"{case}: empty reply to second (prefix/variant) prompt"
