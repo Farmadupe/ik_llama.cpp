@@ -4012,7 +4012,8 @@ static std::pair<int, int> get_batch_ubatch(const gpt_params & params) {
     if (params.n_ctx > 0) {
         n_batch = std::min(n_batch, params.n_ctx);
     }
-    if (!params.mmproj.path.empty() && params.mmproj_use_gpu) {
+    if (0) {
+    // if (!params.mmproj.path.empty() && params.mmproj_use_gpu) {
         // temporary fix for qwen mtmd (only when mmproj is on GPU)
         n_batch = std::max(n_batch, n_ubatch);
         n_ubatch = n_batch;

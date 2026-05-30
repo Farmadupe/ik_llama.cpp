@@ -1281,6 +1281,102 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS*GGML_SCHED
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // TODO: use supports_op to check if the backend supports the op
 
+    // ======================= BODGY OFFLOAD DEBUG (remove later) =======================
+#if 0  // flip to 1 to re-enable the per-op offload-decision spam
+    if (tensor->op == GGML_OP_MUL_MAT_ID || tensor->op == GGML_OP_MOE_FUSED_UP_GATE) {
+        const int cpu_id = sched->n_backends - 1;
+        const bool dbg_offload_enabled = ggml_backend_sched_offload_enabled(sched, tensor->op);
+
+        static int dbg_offload_to_main = -1;
+        if (dbg_offload_to_main < 0) {
+            const char * env = getenv("GGML_SCHED_OFFLOAD_TO_MAIN");
+            dbg_offload_to_main = (env && atoi(env) != 0) ? 1 : 0;
+        }
+
+        printf("\n================ OFFLOAD DEBUG: %s ================\n", tensor->name);
+        printf("  %-38s %s\n",      "op",                              ggml_op_name(tensor->op));
+        printf("  %-38s [%lld, %lld, %lld, %lld]\n", "op ne (dst dims)",
+               (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3]);
+        printf("  %-38s %d\n",      "sched->n_backends",               sched->n_backends);
+        printf("  %-38s %d (%s)\n", "cpu backend id (n_backends-1)",   cpu_id, ggml_backend_name(sched->backends[cpu_id]));
+        printf("  %-38s %s\n",      "offload_enabled (this op)",       dbg_offload_enabled ? "YES" : "NO");
+        printf("  %-38s %d\n",      "env GGML_SCHED_OFFLOAD_TO_MAIN",  dbg_offload_to_main);
+
+        // locate the first WEIGHTS source (this is what drives the real if-chain)
+        int dbg_wsrc_i = -1;
+        int dbg_wsrc_backend_id = -1;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            struct ggml_tensor * s = tensor->src[i];
+            if (s == NULL) continue;
+            const char * busage = "(no buffer)";
+            if (s->buffer != NULL) {
+                busage = s->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ? "WEIGHTS" : "not-weights";
+            }
+            int assigned = tensor_backend_id(s);
+            printf("  src[%d] op=%-14s buf=%-11s assigned_backend=%2d ne=[%lld,%lld,%lld] name=%s\n",
+                   i, ggml_op_name(s->op), busage, assigned,
+                   (long long)s->ne[0], (long long)s->ne[1], (long long)s->ne[2], s->name);
+            if (dbg_wsrc_i < 0 && s->buffer != NULL && s->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                dbg_wsrc_i = i;
+                dbg_wsrc_backend_id = ggml_backend_sched_backend_from_buffer(sched, s, tensor);
+            }
+        }
+        printf("  %-38s %d\n",      "first weight src index",          dbg_wsrc_i);
+        printf("  %-38s %d %s\n",   "weight src backend (from_buffer)", dbg_wsrc_backend_id,
+               dbg_wsrc_backend_id == cpu_id ? "(== CPU, eligible to offload)" :
+               dbg_wsrc_backend_id <  0      ? "(none found)" : "(already on a GPU)");
+
+        // ---- replicate the decision logic verbosely ----
+        printf("  ---- decision replay ----\n");
+        if (dbg_wsrc_i < 0) {
+            printf("  CONCLUSION: no WEIGHTS source -> weight loop returns nothing here (handled by a later pass)\n");
+        } else if (!dbg_offload_enabled) {
+            printf("  CONCLUSION: offload_enabled=NO -> op pinned to weight backend %d == CPU COMPUTE, NO streaming\n", dbg_wsrc_backend_id);
+        } else if (dbg_wsrc_backend_id != cpu_id) {
+            printf("  CONCLUSION: weight already on GPU backend %d -> runs there, offload path not taken\n", dbg_wsrc_backend_id);
+        } else {
+            int chosen = -1;
+            const char * how = "(none)";
+            if (!dbg_offload_to_main) {
+                for (int k = 0; k < GGML_MAX_SRC; k++) {
+                    struct ggml_tensor * act = tensor->src[k];
+                    if (act == NULL) continue;
+                    bool is_weight = act->buffer != NULL && act->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                    int  abid = tensor_backend_id(act);
+                    int  abid_direct = abid;
+                    for (struct ggml_tensor * v = act->view_src; abid < 0 && v != NULL; v = v->view_src) {
+                        abid = tensor_backend_id(v);
+                    }
+                    bool is_gpu = abid >= 0 && abid < cpu_id;
+                    bool sup    = is_gpu && ggml_backend_supports_op(sched->backends[abid], tensor);
+                    bool offl   = is_gpu && ggml_backend_offload_op(sched->backends[abid], tensor);
+                    printf("    act-cand src[%d] weight=%-3s assigned=%2d (via_view=%2d) is_gpu=%-3s supports_op=%-3s offload_op=%-3s name=%s\n",
+                           k, is_weight ? "yes" : "no", abid_direct, abid, is_gpu ? "yes" : "no",
+                           sup ? "yes" : "no", offl ? "yes" : "no", act->name);
+                    if (!is_weight && is_gpu && sup && offl) { chosen = abid; how = "ACTIVATION-LOCALITY (patch)"; break; }
+                }
+            } else {
+                printf("    (GGML_SCHED_OFFLOAD_TO_MAIN=1 -> activation-locality path skipped)\n");
+            }
+            if (chosen < 0) {
+                for (int b = 0; b < cpu_id; b++) {
+                    bool sup  = ggml_backend_supports_op(sched->backends[b], tensor);
+                    bool offl = ggml_backend_offload_op(sched->backends[b], tensor);
+                    printf("    first-gpu b=%d supports_op=%-3s offload_op=%-3s\n", b, sup ? "yes" : "no", offl ? "yes" : "no");
+                    if (sup && offl) { chosen = b; how = "FIRST-GPU fallback"; break; }
+                }
+            }
+            if (chosen < 0) {
+                printf("  CONCLUSION: NO gpu accepted (offload_op=false everywhere) -> stays on CPU backend %d == CPU COMPUTE, NO streaming\n", cpu_id);
+            } else {
+                printf("  CONCLUSION: offload to backend %d (%s) via %s\n", chosen, ggml_backend_name(sched->backends[chosen]), how);
+            }
+        }
+        printf("==================================================================\n");
+    }
+#endif  // BODGY OFFLOAD DEBUG
+    // ===================== END BODGY OFFLOAD DEBUG =====================
+
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
@@ -1315,6 +1411,49 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
             // check if a backend with higher prio wants to offload the op
             if (offload_enabled && src_backend_id == sched->n_backends - 1) {
+                // For MoE expert matmuls whose weights live in host RAM, prefer to
+                // offload to the GPU that already holds this op's activations rather
+                // than always funneling to the highest-priority GPU. This keeps each
+                // layer's expert weight-streaming on its own device's PCIe link (so
+                // pipeline-parallel ubatches don't all contend for one link) and also
+                // avoids an activation round-trip to the main GPU and back.
+                // The activation source is already assigned at this point: the layer's
+                // norm op carries a resident weight, so it is placed on the owning GPU
+                // in pass 1 before this (topologically later) matmul is reached.
+                // Set GGML_SCHED_OFFLOAD_TO_MAIN=1 to restore the old "first GPU" behavior.
+                static int offload_to_main = -1;
+                if (offload_to_main < 0) {
+                    const char * env = getenv("GGML_SCHED_OFFLOAD_TO_MAIN");
+                    offload_to_main = (env && atoi(env) != 0) ? 1 : 0;
+                }
+                if (!offload_to_main &&
+                    (tensor->op == GGML_OP_MUL_MAT_ID || tensor->op == GGML_OP_MOE_FUSED_UP_GATE)) {
+                    for (int k = 0; k < GGML_MAX_SRC; k++) {
+                        struct ggml_tensor * act = tensor->src[k];
+                        if (act == NULL) {
+                            continue;
+                        }
+                        // we want a non-weight source (the activations / ids), which is
+                        // produced on, and therefore already assigned to, the owning GPU
+                        if (act->buffer != NULL && act->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                            continue;
+                        }
+                        // the activation may be a view (e.g. a reshape of ffn_norm) that is
+                        // not yet assigned a backend in this pass; follow view_src to the
+                        // producing tensor, which already carries the owning GPU's backend id
+                        int act_backend_id = tensor_backend_id(act);
+                        for (struct ggml_tensor * v = act->view_src; act_backend_id < 0 && v != NULL; v = v->view_src) {
+                            act_backend_id = tensor_backend_id(v);
+                        }
+                        // only redirect to a real GPU (not CPU, not unassigned) that can run the op
+                        if (act_backend_id >= 0 && act_backend_id < sched->n_backends - 1 &&
+                            ggml_backend_supports_op(sched->backends[act_backend_id], tensor) &&
+                            ggml_backend_offload_op(sched->backends[act_backend_id], tensor)) {
+                            SET_CAUSE(tensor, "1.act%d", k);
+                            return act_backend_id;
+                        }
+                    }
+                }
                 for (int b = 0; b < src_backend_id; b++) {
                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");
@@ -1814,6 +1953,24 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                             tensor_id_copy(src_id, cur_backend_id, 0) = src->src[j];
                         } else {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                        // Streamed weights (e.g. offloaded MoE experts) are consumed serially by the
+                        // computing backend itself; unlike cross-device activation hand-offs they never
+                        // need per-ubatch double-buffering. Give them a single reusable landing pad
+                        // shared across all copy slots (i.e. treat them exactly as the n_copies==1 case),
+                        // so ggml-alloc can recycle it across layers instead of pinning one full-size
+                        // buffer per offloaded weight -- which otherwise makes n_copies>1 reserve the
+                        // entire offload set and OOM.
+                        const bool is_streamed_weight = src->buffer != NULL &&
+                            src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                        if (is_streamed_weight) {
+                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            ggml_format_name(tensor_copy, "%s#%s#shared", ggml_backend_name(backend), src->name);
+                            // intentionally no ggml_set_input/ggml_set_output: allow ggml-alloc to reuse
+                            for (int c = 0; c < sched->n_copies; c++) {
+                                tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                            }
+                            SET_CAUSE(tensor_copy, "4.cpy.w");
+                        } else {
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
@@ -1823,6 +1980,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
+                        }
                         }
                         int n_inputs = split->n_inputs++;
                         if (n_inputs >= GGML_SCHED_MAX_SPLIT_INPUTS) {
