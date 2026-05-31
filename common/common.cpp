@@ -4600,7 +4600,7 @@ void common_batch_add(
                                bool   logits) {
     GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
     batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
+    batch.pos     [batch.n_tokens] = { pos, pos, pos, 0 };
     batch.n_seq_id[batch.n_tokens] = seq_ids.size();
     for (size_t i = 0; i < seq_ids.size(); ++i) {
         batch.seq_id[batch.n_tokens][i] = seq_ids[i];
