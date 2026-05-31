@@ -1,0 +1,6 @@
+models/
+.pytest_cache/
+__pycache__/
+*.pyc
+mrope_bbox_report.html
+*.log
