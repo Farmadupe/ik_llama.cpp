@@ -34,6 +34,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "stb/stb_image_resize2.h"
+
 // stderr (unbuffered) so progress lines stream live when stdout is piped/redirected;
 // matches LOG_ERR and the rest of llama.cpp's logging conventions.
 #define LOG_INF(...) fprintf(stderr, __VA_ARGS__)
