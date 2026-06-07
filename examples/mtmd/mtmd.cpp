@@ -13,10 +13,11 @@
 #include <vector>
 
 // represents raw image data, layout is RGBRGBRGB...
-// length of data must be nx * ny * 3
+// length of data must be nz * nx * ny * 3 (frame-major)
 struct mtmd_bitmap {
     uint32_t nx;
     uint32_t ny;
+    uint32_t nz;
     std::vector<unsigned char> data;
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
@@ -524,16 +525,32 @@ struct mtmd_tokenizer {
                 add_text(ctx->img_beg, true); // add image begin token
             }
 
-            // convert mtmd_bitmap to clip_image_u8
-            clip_image_u8_ptr img_u8(clip_image_u8_init());
-            img_u8->nx = bitmap->nx;
-            img_u8->ny = bitmap->ny;
-            img_u8->buf.resize(bitmap->data.size());
-            std::memcpy(img_u8->buf.data(), bitmap->data.data(), img_u8->nx * img_u8->ny * 3);
+
+            const size_t frame_bytes = (size_t)bitmap->nx * bitmap->ny * 3;
+            auto preprocess_frames = [&](clip_image_f32_batch & out) -> bool {
+                for (uint32_t z = 0; z < bitmap->nz; z++) {
+                    clip_image_u8_ptr img_u8(clip_image_u8_init());
+                    img_u8->nx = bitmap->nx;
+                    img_u8->ny = bitmap->ny;
+                    img_u8->buf.resize(frame_bytes);
+                    std::memcpy(img_u8->buf.data(), bitmap->data.data() + (size_t)z * frame_bytes, frame_bytes);
+                    clip_image_f32_batch one;
+                    if (!clip_image_preprocess(ctx->ctx_v, img_u8.get(), &one)) {
+                        return false;
+                    }
+                    out.grid_x = one.grid_x;
+                    out.grid_y = one.grid_y;
+                    
+                    for (auto & entry : one.entries) {
+                        out.entries.push_back(std::move(entry));
+                    }
+                }
+                return true;
+            };
 
             // preprocess image
             clip_image_f32_batch batch_f32;
-            bool ok = clip_image_preprocess(ctx->ctx_v, img_u8.get(), &batch_f32);
+            bool ok = preprocess_frames(batch_f32);
             if (!ok) {
                 LOG_ERR("Unable to preprocess image\n");
                 return 2;
@@ -604,6 +621,9 @@ struct mtmd_tokenizer {
                 for (const auto & entry : batch_f32.entries) {
                     n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
                 }
+
+                // For now, assume that temporal pooling always collapsed the input number of frames to 1.
+                n_tokens /= bitmap->nz; 
 
                 mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
                 if (ctx->use_mrope) {
@@ -905,7 +925,23 @@ mtmd_bitmap * mtmd_bitmap_init(uint32_t nx,
     mtmd_bitmap * bitmap = new mtmd_bitmap;
     bitmap->nx = nx;
     bitmap->ny = ny;
+    bitmap->nz = 1;
     size_t data_size = (size_t)nx * ny * 3;
+    bitmap->data.resize(data_size);
+    std::memcpy(bitmap->data.data(), data, data_size);
+    return bitmap;
+}
+
+mtmd_bitmap * mtmd_bitmap_init_frames(uint32_t nx,
+                                      uint32_t ny,
+                                      uint32_t nz,
+                                      const unsigned char * data) {
+    GGML_ASSERT(nx > 0 && ny > 0 && nz > 0 && data != nullptr);
+    mtmd_bitmap * bitmap = new mtmd_bitmap;
+    bitmap->nx = nx;
+    bitmap->ny = ny;
+    bitmap->nz = nz;
+    size_t data_size = (size_t)nz * nx * ny * 3;
     bitmap->data.resize(data_size);
     std::memcpy(bitmap->data.data(), data, data_size);
     return bitmap;
@@ -916,6 +952,7 @@ mtmd_bitmap * mtmd_bitmap_init_from_audio(size_t n_samples,
     mtmd_bitmap * bitmap = new mtmd_bitmap;
     bitmap->nx = n_samples;
     bitmap->ny = 1;
+    bitmap->nz = 1;
     bitmap->is_audio = true;
     size_t data_size = n_samples * sizeof(float);
     bitmap->data.resize(data_size);
@@ -929,6 +966,10 @@ uint32_t mtmd_bitmap_get_nx(const mtmd_bitmap * bitmap) {
 
 uint32_t mtmd_bitmap_get_ny(const mtmd_bitmap * bitmap) {
     return bitmap->ny;
+}
+
+uint32_t mtmd_bitmap_get_nz(const mtmd_bitmap * bitmap) {
+    return bitmap->nz;
 }
 
 const unsigned char * mtmd_bitmap_get_data(const mtmd_bitmap * bitmap) {

@@ -125,13 +125,18 @@ MTMD_API int mtmd_get_audio_bitrate(mtmd_context * ctx);
 // if bitmap is image:
 //     length of data must be nx * ny * 3
 //     the data is in RGBRGBRGB... format
+// if bitmap is a multi-frame image (e.g. a video chunk):
+//     use mtmd_bitmap_init_frames; length of data must be nz * nx * ny * 3 (frame-major)
+//     all frames share the same nx, ny
 // if bitmap is audio:
 //     length of data must be n_samples * sizeof(float)
 //     the data is in float format (PCM F32)
 MTMD_API mtmd_bitmap *         mtmd_bitmap_init           (uint32_t nx, uint32_t ny, const unsigned char * data);
+MTMD_API mtmd_bitmap *         mtmd_bitmap_init_frames    (uint32_t nx, uint32_t ny, uint32_t nz, const unsigned char * data);
 MTMD_API mtmd_bitmap *         mtmd_bitmap_init_from_audio(size_t n_samples,         const float         * data);
 MTMD_API uint32_t              mtmd_bitmap_get_nx     (const mtmd_bitmap * bitmap);
 MTMD_API uint32_t              mtmd_bitmap_get_ny     (const mtmd_bitmap * bitmap);
+MTMD_API uint32_t              mtmd_bitmap_get_nz     (const mtmd_bitmap * bitmap);
 MTMD_API const unsigned char * mtmd_bitmap_get_data   (const mtmd_bitmap * bitmap);
 MTMD_API size_t                mtmd_bitmap_get_n_bytes(const mtmd_bitmap * bitmap);
 MTMD_API bool                  mtmd_bitmap_is_audio   (const mtmd_bitmap * bitmap);
