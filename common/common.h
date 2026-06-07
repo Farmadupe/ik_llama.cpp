@@ -403,7 +403,7 @@ struct gpt_params {
     bool conversation      = false; // conversation mode (does not print special tokens and suffix/prefix)
     bool prompt_cache_all  = false; // save user input and generations to prompt cache
     bool prompt_cache_ro   = false; // open the prompt cache read-only and do not update it
-    bool ctx_shift         = true;
+    bool ctx_shift         = false;
     bool escape            = true;  // escape "\n", "\r", "\t", "\'", "\"", and "\\"
     bool multiline_input   = false; // reverse the usage of `\`
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles

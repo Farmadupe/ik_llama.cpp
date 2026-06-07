@@ -21,6 +21,7 @@ struct mtmd_bitmap {
     std::vector<unsigned char> data;
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
+    bool is_video = false; // true if the bitmap is a temporal/video chunk
 };
 
 struct mtmd_image_tokens {
@@ -122,6 +123,8 @@ struct mtmd_context {
     // these are not token, but strings used to mark the beginning and end of image/audio embeddings
     std::string img_beg;
     std::string img_end;
+    std::string vid_beg;
+    std::string vid_end;
     std::string aud_beg;
     std::string aud_end;
 
@@ -312,6 +315,8 @@ struct mtmd_context {
             // template renders: <|media_begin|>image<|media_content|> <pad/embeddings> <|media_end|>
             img_beg = "<|media_begin|>image<|media_content|>";
             img_end = "<|media_end|>";
+            vid_beg = "<|media_begin|>video<|media_content|>";
+            vid_end = "<|media_end|>";
         }
     }
 
@@ -521,8 +526,12 @@ struct mtmd_tokenizer {
                 return 2;
             }
 
-            if (!ctx->img_beg.empty()) {
-                add_text(ctx->img_beg, true); // add image begin token
+            const bool is_video = bitmap->is_video;
+            const std::string & media_beg = (is_video && !ctx->vid_beg.empty()) ? ctx->vid_beg : ctx->img_beg;
+            const std::string & media_end = (is_video && !ctx->vid_end.empty()) ? ctx->vid_end : ctx->img_end;
+
+            if (!media_beg.empty()) {
+                add_text(media_beg, true);
             }
 
 
@@ -652,8 +661,8 @@ struct mtmd_tokenizer {
                 cur.entries.emplace_back(std::move(chunk));
             }
 
-            if (!ctx->img_end.empty()) {
-                add_text(ctx->img_end, true); // add image end token
+            if (!media_end.empty()) {
+                add_text(media_end, true);
             }
 
         } else {
@@ -948,6 +957,7 @@ mtmd_bitmap * mtmd_bitmap_init_frames(uint32_t nx,
     bitmap->nx = nx;
     bitmap->ny = ny;
     bitmap->nz = nz;
+    bitmap->is_video = true;
     size_t data_size = (size_t)nz * nx * ny * 3;
     bitmap->data.resize(data_size);
     std::memcpy(bitmap->data.data(), data, data_size);
