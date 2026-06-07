@@ -5832,6 +5832,17 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     }
 }
 
+int clip_n_max_temporal_frames(const struct clip_ctx * ctx) {
+    // Max frames that may be packed into a single temporal chunk
+    // This is probably available from hparams, but is hardcoded for now.
+    switch (ctx->proj_type()) {
+        case PROJECTOR_TYPE_KIMIK25:
+            return 4;
+        default:
+            return 0; // temporal input not supported by this projector family
+    }
+}
+
 int clip_is_minicpmv(const struct clip_ctx * ctx) {
     if (ctx->proj_type() == PROJECTOR_TYPE_MINICPMV) {
         return ctx->model.hparams.minicpmv_version;

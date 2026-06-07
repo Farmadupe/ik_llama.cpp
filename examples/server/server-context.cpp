@@ -454,6 +454,7 @@ void server_context::init() {
             /* tmpls                 */ std::move(chat_templates),
             /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
             /* allow_audio           */ mctx ? mtmd_support_audio(mctx) : false,
+            /* max_temporal_frames   */ mctx ? mtmd_get_max_temporal_frames(mctx) : 0,
             /* enable_thinking       */ enable_thinking,
             /* parallel_tool_calls  */ params_base.parallel_tool_calls,
             /* reasoning_budget      */ params_base.reasoning_budget,
