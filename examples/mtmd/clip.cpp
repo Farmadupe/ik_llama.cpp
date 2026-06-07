@@ -4439,6 +4439,26 @@ struct img_tool {
         return {w_bar, h_bar};
     }
 
+    static clip_image_size calc_size_navit_kimik25(const clip_image_size & inp_size, int patch_size, int max_pixels) {
+        const int in_patch_limit = max_pixels / (patch_size * patch_size);
+        const int patch_limit_on_one_side = 512;
+        const int width  = inp_size.width;
+        const int height = inp_size.height;
+
+        const double s1 = std::sqrt(static_cast<double>(in_patch_limit) /
+                                    (std::max(1.0, static_cast<double>(width  / patch_size)) *
+                                     std::max(1.0, static_cast<double>(height / patch_size))));
+        const double s2 = static_cast<double>(patch_limit_on_one_side) * patch_size / width;
+        const double s3 = static_cast<double>(patch_limit_on_one_side) * patch_size / height;
+        const double scale = std::min(std::min(1.0, s1), std::min(s2, s3));
+
+        int new_w = std::max(1, static_cast<int>(width  * scale));
+        int new_h = std::max(1, static_cast<int>(height * scale));
+        new_w = std::min(new_w, patch_limit_on_one_side * patch_size);
+        new_h = std::min(new_h, patch_limit_on_one_side * patch_size);
+        return {new_w, new_h};
+    }
+
     // draw src image into dst image at offset (offset_x, offset_y)
     static void composite(clip_image_u8 & dst, const clip_image_u8 & src, int offset_x, int offset_y) {
         for (int y = 0; y < src.ny; ++y) {
@@ -4969,17 +4989,23 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
         case PROJECTOR_TYPE_KIMIK25:
             {
                 GGML_ASSERT(params.image_min_pixels > 0 && params.image_max_pixels > 0);
-                const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
+                const clip_image_size scaled = img_tool::calc_size_navit_kimik25(
                     original_size,
-                    params.patch_size * params.n_merge,
-                    params.image_min_pixels,
+                    params.patch_size,
                     params.image_max_pixels);
-                const std::array<uint8_t, 3> pad_color = {0, 0, 0};
+                const int factor = params.patch_size * params.n_merge;
 
                 clip_image_u8 resized_img;
-                img_tool::resize(*img, resized_img, target_size, img_tool::RESIZE_ALGO_BICUBIC, true, pad_color);
+                img_tool::resize(*img, resized_img, scaled, img_tool::RESIZE_ALGO_BICUBIC, false);
+
+                clip_image_u8 padded_img;
+                padded_img.nx = CLIP_ALIGN(scaled.width,  factor);
+                padded_img.ny = CLIP_ALIGN(scaled.height, factor);
+                padded_img.buf.assign(static_cast<size_t>(3) * padded_img.nx * padded_img.ny, 0);
+                img_tool::composite(padded_img, resized_img, 0, 0);
+
                 clip_image_f32_ptr res(clip_image_f32_init());
-                normalize_image_u8_to_f32(resized_img, *res, params.image_mean, params.image_std);
+                normalize_image_u8_to_f32(padded_img, *res, params.image_mean, params.image_std);
                 res_imgs->entries.push_back(std::move(res));
             } break;
 
