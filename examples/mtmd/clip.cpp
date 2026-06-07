@@ -5269,6 +5269,12 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // TODO @ngxson : implement batch size > 1 as a loop
     //                we don't need true batching support because the cgraph will gonna be big anyway
     if (batch_size != 1) {
+        // Kimi-K2.5 video chunks arrive here as multiple frames (one entry per frame).
+        // The encoder graph does not yet consume them jointly (temporal pos / RoPE repeat /
+        // temporal pool), so fail loudly rather than silently encoding only the first frame.
+        if (ctx->proj_type() == PROJECTOR_TYPE_KIMIK25) {
+            LOG_ERR("%s: Kimi-K2.5 multi-frame (video) encoding is not yet implemented (got %d frames)\n", __func__, batch_size);
+        }
         return false; // only support batch size of 1
     }
 
