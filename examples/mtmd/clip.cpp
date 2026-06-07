@@ -547,13 +547,14 @@ struct clip_graph {
     const clip_model & model;
     const clip_hparams & hparams;
 
-    // we only support single image per batch
+    // a single image per batch, except Kimi-K2.5 video chunks which pass nz frames
     const clip_image_f32 & img;
 
     const int patch_size;
     const int n_patches_x;
     const int n_patches_y;
     const int n_patches;
+    const int nz; // number of temporal frames packed into this graph (1 for images)
     const int n_embd;
     const int n_head;
     const int d_head;
@@ -565,7 +566,7 @@ struct clip_graph {
     ggml_context * ctx0;
     ggml_cgraph * gf;
 
-    clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
+    clip_graph(clip_ctx * ctx, const clip_image_f32 & img, int nz) :
             ctx(ctx),
             model(ctx->model),
             hparams(model.hparams),
@@ -574,6 +575,7 @@ struct clip_graph {
             n_patches_x(img.nx / patch_size),
             n_patches_y(img.ny / patch_size),
             n_patches(n_patches_x * n_patches_y),
+            nz(nz),
             n_embd(hparams.n_embd),
             n_head(hparams.n_head),
             d_head(n_embd / n_head),
@@ -1596,11 +1598,15 @@ struct clip_graph {
     }
 
     ggml_cgraph * build_kimik25() {
-        ggml_tensor * pos_h = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        // For video chunks the ViT sees nz frames jointly: n_patches per frame, nz frames,
+        // laid out frame-major. Positions repeat the per-frame 2D grid for each frame.
+        const int n_pos_total = n_patches * nz;
+
+        ggml_tensor * pos_h = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pos_total);
         ggml_set_name(pos_h, "pos_h");
         ggml_set_input(pos_h);
 
-        ggml_tensor * pos_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        ggml_tensor * pos_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pos_total);
         ggml_set_name(pos_w, "pos_w");
         ggml_set_input(pos_w);
 
@@ -1608,6 +1614,7 @@ struct clip_graph {
 
         // Kimi-K2.5 uses interleaved 2D RoPE pattern natively, but
         // Q / K are permuted during conversion to use split format.
+        // RoPE is purely spatial; for video the same per-frame grid is repeated per frame.
         auto add_pos = [&](ggml_tensor * cur, const clip_layer &) {
             cur = build_rope_2d(ctx0, cur, pos_w, pos_h, hparams.rope_theta, false);
             return cur;
@@ -1615,12 +1622,27 @@ struct clip_graph {
 
         ggml_tensor * inp = build_inp();
 
+        // Add the spatial learned position embedding. inp is [n_embd, n_patches * nz];
+        // learned_pos_embd is [n_embd, n_patches] and broadcasts across the nz frames.
         // I don't know why, but doing this in the build_vit lead to the ggml_add not occurring?
         // Doing it manually here does work.
         inp = ggml_add(ctx0, inp, learned_pos_embd);
 
+        // For video chunks, add the temporal (sincos) position embedding on top: each frame f
+        // gets a constant per-channel offset time_embd[:, f], broadcast across its patches.
+        // A still image (nz == 1) gets no temporal term, matching the reference's t == 1 path.
+        if (nz > 1) {
+            ggml_tensor * time_embd = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, nz);
+            ggml_set_name(time_embd, "time_embd");
+            ggml_set_input(time_embd);
+
+            inp = ggml_reshape_3d(ctx0, inp, n_embd, n_patches, nz);
+            inp = ggml_add(ctx0, inp, time_embd); // broadcasts over the n_patches dimension
+            inp = ggml_reshape_2d(ctx0, inp, n_embd, n_patches * nz);
+        }
+
         ggml_tensor * cur = build_vit(
-                                inp, n_patches,
+                                inp, n_pos_total,
                                 NORM_TYPE_NORMAL,
                                 hparams.ffn_op,
                                 nullptr,
@@ -1629,6 +1651,22 @@ struct clip_graph {
         cb(cur, "vit_out", -1);
 
         {
+            // For video chunks, temporally mean-pool the nz frames before the spatial merge.
+            // cur is frame-major [n_embd, n_patches * nz]; average the nz contiguous
+            // [n_embd, n_patches] frame blocks into a single [n_embd, n_patches] grid.
+            // Mean is linear so it commutes with the spatial 2x2 reshape (reference
+            // tpool_patch_merger does .mean(dim=0)), hence the merger below is unchanged.
+            if (nz > 1) {
+                ggml_tensor * acc = ggml_view_2d(ctx0, cur, n_embd, n_patches, cur->nb[1], 0);
+                for (int f = 1; f < nz; f++) {
+                    ggml_tensor * frame = ggml_view_2d(ctx0, cur, n_embd, n_patches,
+                        cur->nb[1], (size_t) f * n_patches * cur->nb[1]);
+                    acc = ggml_add(ctx0, acc, frame);
+                }
+                cur = ggml_scale(ctx0, acc, 1.0f / (float) nz);
+                cb(cur, "temporal_pool", -1);
+            }
+
             // patch_merger
             const int scale_factor = model.hparams.n_merge;
             cur = build_patch_merge_permute(cur, scale_factor);
@@ -2492,8 +2530,17 @@ private:
     ggml_tensor * build_inp() {
         ggml_tensor * inp_raw = build_inp_raw();
         ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
-        inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
-        inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
+        if (nz > 1) {
+            // batched conv output is [n_patches_x, n_patches_y, n_embd, nz];
+            // flatten to [n_embd, n_patches * nz] in frame-major order (frame outermost),
+            // matching the navit (t, h, w) patch ordering of the reference.
+            inp = ggml_reshape_3d(ctx0, inp, n_patches, n_embd, nz);
+            inp = ggml_cont(ctx0, ggml_permute(ctx0, inp, 1, 0, 2, 3)); // [n_embd, n_patches, nz]
+            inp = ggml_reshape_2d(ctx0, inp, n_embd, n_patches * nz);
+        } else {
+            inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
+            inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
+        }
         if (model.patch_bias) {
             inp = ggml_add(ctx0, inp, model.patch_bias);
             cb(inp, "patch_bias", -1);
@@ -2502,7 +2549,9 @@ private:
     }
 
     ggml_tensor * build_inp_raw(int channels = 3) {
-        ggml_tensor * inp_raw = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, img.nx, img.ny, channels);
+        // nz == 1 for images (ne[3] == 1 is equivalent to the old 3D tensor);
+        // nz > 1 carries a frame batch for Kimi-K2.5 video chunks.
+        ggml_tensor * inp_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img.nx, img.ny, channels, nz);
         ggml_set_name(inp_raw, "inp_raw");
         ggml_set_input(inp_raw);
         return inp_raw;
@@ -2852,8 +2901,11 @@ private:
 };
 
 static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
-    GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
-    clip_graph graph(ctx, *imgs.entries[0]);
+    // Kimi-K2.5 video chunks pass nz frames (one entry per frame) to be encoded jointly;
+    // every other projector supports only a single image per graph.
+    const bool multi_frame = ctx->proj_type() == PROJECTOR_TYPE_KIMIK25;
+    GGML_ASSERT((imgs.entries.size() == 1 || multi_frame) && "n_batch > 1 is not supported");
+    clip_graph graph(ctx, *imgs.entries[0], (int) imgs.entries.size());
 
     ggml_cgraph * res;
 
@@ -5110,18 +5162,20 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
 
 bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec) {
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
-    int batch_size = imgs.entries.size();
 
-    // TODO @ngxson : implement batch size > 1 as a loop
+    // TODO @ngxson : implement n_entries > 1 as a loop
     //                we don't need true batching support because the cgraph will gonna be big anyway
-    if (batch_size != 1) {
-        // Kimi-K2.5 video chunks arrive here as multiple frames (one entry per frame).
-        // The encoder graph does not yet consume them jointly (temporal pos / RoPE repeat /
-        // temporal pool), so fail loudly rather than silently encoding only the first frame.
-        if (ctx->proj_type() == PROJECTOR_TYPE_KIMIK25) {
-            LOG_ERR("%s: Kimi-K2.5 multi-frame (video) encoding is not yet implemented (got %d frames)\n", __func__, batch_size);
+    const size_t n_entries = imgs.entries.size();
+
+    // kimik2.5 experimental temporal support
+    if (ctx->proj_type() == PROJECTOR_TYPE_KIMIK25) {
+        if ((n_entries < 1) || (n_entries > 4))  {
+            return false;
         }
-        return false; // only support batch size of 1
+    } else {
+        if (n_entries != 1) {
+            return false;
+        }
     }
 
     // build the inference graph
@@ -5188,23 +5242,24 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         // └─────┘ │
         //   ──────┘ x B
 
+        // frame-major: each entry (frame) is written planar at its own offset
+        size_t base_off = 0;
         for (size_t i = 0; i < imgs.entries.size(); i++) {
             const int nx = imgs.entries[i]->nx;
             const int ny = imgs.entries[i]->ny;
             const int n = nx * ny;
 
-            for (int b = 0; b < batch_size; b++) {
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
-                        size_t base_dst =    y * nx + x;  // idx of the first channel
-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
-                    }
+            float * batch_entry = inp_raw.data() + base_off;
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3*(y * nx + x); // idx of the first channel
+                    size_t base_dst =    y * nx + x;  // idx of the first channel
+                    batch_entry[      base_dst] = imgs.entries[i]->buf[base_src    ];
+                    batch_entry[1*n + base_dst] = imgs.entries[i]->buf[base_src + 1];
+                    batch_entry[2*n + base_dst] = imgs.entries[i]->buf[base_src + 2];
                 }
             }
+            base_off += 3*n;
         }
         set_input_f32("inp_raw", inp_raw);
 
@@ -5379,7 +5434,6 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_KIMIVL:
-        case PROJECTOR_TYPE_KIMIK25:
         case PROJECTOR_TYPE_LIGHTONOCR:
             {
                 // set the 2D positions
@@ -5395,6 +5449,46 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                     pos_data[i] = i % n_patches_per_col;
                 }
                 set_input_i32("pos_w", pos_data);
+            } break;
+        case PROJECTOR_TYPE_KIMIK25:
+            {
+                // set the 2D positions. For video chunks the same per-frame grid is repeated
+                // for each of the nz frames (frame-major), matching the reference's RoPE
+                // .repeat(t). For a single image n_frames == 1.
+                int n_patches_per_col = image_size_width / patch_size;
+                const int n_frames = (int) imgs.entries.size();
+                std::vector<int> pos_data((size_t) n_pos * n_frames);
+                // dimension H
+                for (int f = 0; f < n_frames; f++) {
+                    for (int i = 0; i < n_pos; i++) {
+                        pos_data[(size_t) f * n_pos + i] = i / n_patches_per_col;
+                    }
+                }
+                set_input_i32("pos_h", pos_data);
+                // dimension W
+                for (int f = 0; f < n_frames; f++) {
+                    for (int i = 0; i < n_pos; i++) {
+                        pos_data[(size_t) f * n_pos + i] = i % n_patches_per_col;
+                    }
+                }
+                set_input_i32("pos_w", pos_data);
+
+                // temporal (sincos) position embedding for video chunks (nz > 1):
+                //   time_embd[:, f] = [ sin(f*omega) | cos(f*omega) ], omega[i] = 10000^(-2i/D)
+                // matching the reference get_1d_sincos_pos_embed. Computed in double, stored f32.
+                if (n_frames > 1) {
+                    const int D = hparams.n_embd;
+                    std::vector<float> time_embd((size_t) D * n_frames);
+                    for (int f = 0; f < n_frames; f++) {
+                        for (int c = 0; c < D / 2; c++) {
+                            double omega = 1.0 / std::pow(10000.0, (2.0 * c) / D);
+                            double angle = (double) f * omega;
+                            time_embd[(size_t) f * D + c]         = (float) std::sin(angle);
+                            time_embd[(size_t) f * D + D / 2 + c] = (float) std::cos(angle);
+                        }
+                    }
+                    set_input_f32("time_embd", time_embd);
+                }
             } break;
         case PROJECTOR_TYPE_GLM_EDGE:
         {
