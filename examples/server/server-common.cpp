@@ -763,6 +763,95 @@ json oaicompat_chat_params_parse(
                 p.erase("image_url");
 
             }
+            else if (type == "temporal_images") {
+                // A chunk of frames (e.g. a short video segment) handled jointly by the
+                // vision encoder. Generic content type; the model decides how many frames
+                // fit per chunk. Frame sampling / timestamps are the caller's concern.
+                if (!opt.allow_image) {
+                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                }
+                if (opt.max_temporal_frames < 1) {
+                    throw std::runtime_error("this model does not support temporal image input");
+                }
+
+                json frames = json_value(p, "temporal_images", json::array());
+                if (!frames.is_array() || frames.empty()) {
+                    throw std::runtime_error("'temporal_images' must be a non-empty array of image URLs");
+                }
+                const int n_frames = (int) frames.size();
+                if (n_frames > opt.max_temporal_frames) {
+                    throw std::runtime_error("temporal_images: " + std::to_string(n_frames)
+                        + " frames requested but this model supports at most "
+                        + std::to_string(opt.max_temporal_frames) + " per chunk");
+                }
+
+                // fetch one frame URL (http download or data: base64) -> encoded image bytes
+                auto fetch_frame = [&](const json& item) -> raw_buffer {
+                    std::string url = item.is_string() ? item.get<std::string>()
+                                                       : json_value(item, "url", std::string());
+                    if (url.empty()) {
+                        throw std::runtime_error("temporal_images: each element must be an image URL string");
+                    }
+                    if (string_starts_with(url, "http")) {
+                        common_remote_params params;
+                        params.headers.push_back("User-Agent: ik_llama.cpp/");
+                        params.max_size = 1024 * 1024 * 10; // 10MB
+                        params.timeout = 10; // seconds
+                        LOG_INFO("downloading image from '%s'\n", url.c_str());
+                        auto res = common_remote_get_content(url, params);
+                        if (200 <= res.first && res.first < 300) {
+                            LOG_INFO("downloaded %ld bytes\n", res.second.size());
+                            return raw_buffer(res.second.begin(), res.second.end());
+                        }
+                        throw std::runtime_error("Failed to download image");
+                    }
+                    std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
+                    if (parts.size() != 2) {
+                        throw std::runtime_error("Invalid temporal_images url value");
+                    }
+                    else if (!string_starts_with(parts[0], "data:image/")) {
+                        throw std::runtime_error("Invalid temporal_images url format: " + parts[0]);
+                    }
+                    else if (!string_ends_with(parts[0], "base64")) {
+                        throw std::runtime_error("temporal_images url must be base64 encoded");
+                    }
+                    const int64_t t_b64 = ggml_time_us();
+                    raw_buffer decoded = base64_decode(parts[1]);
+                    if (trace) trace->add_base64_us(ggml_time_us() - t_b64);
+                    return decoded;
+                };
+
+                if (n_frames == 1) {
+                    // degenerate chunk: just a normal single image -> normal image path.
+                    out_files.push_back(fetch_frame(frames[0]));
+                } else {
+                    // Pack the N encoded frames into one internal IMAGE_TEMPORAL container so
+                    // the existing flat file channel carries the group intact. This buffer is
+                    // built and consumed entirely in-process (mtmd-helper sniffs + unpacks it),
+                    // so the layout is private and host-endian.
+                    //   "IMAGE_TEMPORAL" (14B magic, no NUL) | nz:u8 | nz * ( len:u32 | len bytes )
+                    raw_buffer container;
+                    auto append_bytes = [&](const void* src, size_t count) {
+                        const uint8_t* bytes = (const uint8_t*) src;
+                        container.insert(container.end(), bytes, bytes + count);
+                    };
+                    append_bytes("IMAGE_TEMPORAL", 14);
+                    const uint8_t frame_count = (uint8_t) n_frames;
+                    append_bytes(&frame_count, 1);
+                    for (auto& item : frames) {
+                        raw_buffer frame = fetch_frame(item);
+                        const uint32_t blob_len = (uint32_t) frame.size();
+                        append_bytes(&blob_len, sizeof(blob_len));
+                        append_bytes(frame.data(), frame.size());
+                    }
+                    out_files.push_back(std::move(container));
+                }
+
+                p["type"] = "media_marker";
+                p["text"] = mtmd_default_marker();
+                p.erase("temporal_images");
+
+            }
             else if (type == "input_audio") {
                 if (!opt.allow_audio) {
                     throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");

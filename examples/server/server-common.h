@@ -288,6 +288,7 @@ struct server_chat_params {
     common_chat_templates_ptr  tmpls;
     bool allow_image;
     bool allow_audio;
+    int  max_temporal_frames; // max frames per temporal_images chunk; 0 == temporal input not supported
     bool enable_thinking = true;
     bool parallel_tool_calls = false;
     int  reasoning_budget = -1;

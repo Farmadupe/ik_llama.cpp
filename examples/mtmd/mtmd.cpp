@@ -913,6 +913,13 @@ int mtmd_get_audio_bitrate(mtmd_context * ctx) {
     return 16000; // 16kHz
 }
 
+int mtmd_get_max_temporal_frames(mtmd_context * ctx) {
+    if (!ctx->ctx_v) {
+        return 0; // no vision context: temporal input not supported
+    }
+    return clip_n_max_temporal_frames(ctx->ctx_v);
+}
+
 //
 // public API functions
 //

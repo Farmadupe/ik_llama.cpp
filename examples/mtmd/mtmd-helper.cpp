@@ -560,7 +560,67 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 
 } // namespace audio_helpers
 
+// Decode an internal IMAGE_TEMPORAL container (built by the server, never sent on the
+// wire) into one multi-frame bitmap. Layout (host-endian, private):
+//   "IMAGE_TEMPORAL" (14B magic, no NUL) | nz:u8 | nz * ( blob_len:u32 | blob_len bytes )
+// Each blob is an encoded image (PNG/JPEG/...). All frames must decode to the same nx/ny;
+// the request is rejected (nullptr) otherwise, so no implicit resizing is needed.
+static mtmd_bitmap * bitmap_init_from_temporal_container(const unsigned char * buf, size_t len) {
+    size_t offset = 14; // past the magic (already matched by the caller)
+    if (offset + 1 > len) {
+        LOG_ERR("%s: truncated temporal container header\n", __func__);
+        return nullptr;
+    }
+    const uint32_t nz = buf[offset];
+    offset += 1;
+    if (nz == 0) {
+        LOG_ERR("%s: temporal container declares zero frames\n", __func__);
+        return nullptr;
+    }
+
+    int nx = 0, ny = 0;
+    std::vector<unsigned char> packed; // [nz * ny * nx * 3], frame-major
+    for (uint32_t frame = 0; frame < nz; frame++) {
+        if (offset + 4 > len) {
+            LOG_ERR("%s: truncated frame length at frame %u/%u\n", __func__, frame, nz);
+            return nullptr;
+        }
+        uint32_t blob_len = 0;
+        std::memcpy(&blob_len, buf + offset, sizeof(blob_len));
+        offset += 4;
+        if (offset + blob_len > len) {
+            LOG_ERR("%s: truncated frame data at frame %u/%u\n", __func__, frame, nz);
+            return nullptr;
+        }
+        int frame_nx = 0, frame_ny = 0, frame_nc = 0;
+        unsigned char * frame_data = stbi_load_from_memory(buf + offset, (int) blob_len, &frame_nx, &frame_ny, &frame_nc, 3);
+        offset += blob_len;
+        if (!frame_data) {
+            LOG_ERR("%s: failed to decode frame %u/%u\n", __func__, frame, nz);
+            return nullptr;
+        }
+        if (frame == 0) {
+            nx = frame_nx;
+            ny = frame_ny;
+            packed.resize((size_t) nz * ny * nx * 3);
+        } else if (frame_nx != nx || frame_ny != ny) {
+            LOG_ERR("%s: frame %u is %dx%d but frame 0 is %dx%d; all temporal frames must be the same size\n",
+                    __func__, frame, frame_nx, frame_ny, nx, ny);
+            stbi_image_free(frame_data);
+            return nullptr;
+        }
+        std::memcpy(packed.data() + (size_t) frame * ny * nx * 3, frame_data, (size_t) ny * nx * 3);
+        stbi_image_free(frame_data);
+    }
+
+    return mtmd_bitmap_init_frames((uint32_t) nx, (uint32_t) ny, nz, packed.data());
+}
+
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
+    if (len >= 15 && memcmp(buf, "IMAGE_TEMPORAL", 14) == 0) {
+        return bitmap_init_from_temporal_container(buf, len);
+    }
+
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
         int bitrate = mtmd_get_audio_bitrate(ctx);

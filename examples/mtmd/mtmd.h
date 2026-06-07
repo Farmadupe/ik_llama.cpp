@@ -120,6 +120,10 @@ MTMD_API bool mtmd_support_audio(mtmd_context * ctx);
 // return -1 if audio is not supported
 MTMD_API int mtmd_get_audio_bitrate(mtmd_context * ctx);
 
+// max number of frames that may be packed into one multi-frame (video) chunk
+// for this model's projector family; 0 means temporal input is not supported
+MTMD_API int mtmd_get_max_temporal_frames(mtmd_context * ctx);
+
 // mtmd_bitmap
 //
 // if bitmap is image:
