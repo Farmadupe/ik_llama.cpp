@@ -41,6 +41,17 @@ MTMD_API mtmd_bitmap * mtmd_helper_bitmap_init_from_file(mtmd_context * ctx, con
 // this function is thread-safe
 MTMD_API mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len);
 
+// like mtmd_helper_bitmap_init_from_buf, but consults the media memo on ctx:
+// on a hit, pixel decoding is skipped entirely and the returned bitmap carries
+// only identity (id, dims) plus the encoded source bytes. on a miss, decodes
+// eagerly and attaches the source bytes so tokenize can memoize.
+// in both cases the bitmap id (pixel-content hash) is set; audio is always eager.
+MTMD_API mtmd_bitmap * mtmd_helper_bitmap_init_lazy(mtmd_context * ctx, const unsigned char * buf, size_t len);
+
+// decode image or IMAGE_TEMPORAL container bytes into a pixel bitmap.
+// no audio handling, no memo interaction.
+MTMD_API mtmd_bitmap * mtmd_helper_decode_container(const unsigned char * buf, size_t len);
+
 // helper to count the total number of tokens from a list of chunks, useful to keep track of KV cache
 MTMD_API size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks);
 

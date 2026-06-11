@@ -9,6 +9,7 @@
 
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd-media-memo.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -616,23 +617,9 @@ static mtmd_bitmap * bitmap_init_from_temporal_container(const unsigned char * b
     return mtmd_bitmap_init_frames((uint32_t) nx, (uint32_t) ny, nz, packed.data());
 }
 
-mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
+mtmd_bitmap * mtmd_helper_decode_container(const unsigned char * buf, size_t len) {
     if (len >= 15 && memcmp(buf, "IMAGE_TEMPORAL", 14) == 0) {
         return bitmap_init_from_temporal_container(buf, len);
-    }
-
-    if (audio_helpers::is_audio_file((const char *)buf, len)) {
-        std::vector<float> pcmf32;
-        int bitrate = mtmd_get_audio_bitrate(ctx);
-        if (bitrate < 0) {
-            LOG_ERR("This model does not support audio input\n");
-            return nullptr;
-        }
-        if (!audio_helpers::decode_audio_from_buf(buf, len, bitrate, pcmf32)) {
-            LOG_ERR("Unable to read WAV audio file from buffer\n");
-            return nullptr;
-        }
-        return mtmd_bitmap_init_from_audio(pcmf32.size(), pcmf32.data());
     }
 
     // otherwise, we assume it's an image
@@ -648,6 +635,57 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
         stbi_image_free(data);
     }
     return result;
+}
+
+mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
+    if (audio_helpers::is_audio_file((const char *)buf, len)) {
+        std::vector<float> pcmf32;
+        int bitrate = mtmd_get_audio_bitrate(ctx);
+        if (bitrate < 0) {
+            LOG_ERR("This model does not support audio input\n");
+            return nullptr;
+        }
+        if (!audio_helpers::decode_audio_from_buf(buf, len, bitrate, pcmf32)) {
+            LOG_ERR("Unable to read WAV audio file from buffer\n");
+            return nullptr;
+        }
+        return mtmd_bitmap_init_from_audio(pcmf32.size(), pcmf32.data());
+    }
+
+    return mtmd_helper_decode_container(buf, len);
+}
+
+mtmd_bitmap * mtmd_helper_bitmap_init_lazy(mtmd_context * ctx, const unsigned char * buf, size_t len) {
+    // audio stays fully eager; just give it a content id like the others
+    if (audio_helpers::is_audio_file((const char *)buf, len)) {
+        mtmd_bitmap * bmp = mtmd_helper_bitmap_init_from_buf(ctx, buf, len);
+        if (bmp) {
+            std::string id = std::to_string(mtmd_media_memo::fnv1a(mtmd_bitmap_get_data(bmp), mtmd_bitmap_get_n_bytes(bmp)));
+            mtmd_bitmap_set_id(bmp, id.c_str());
+        }
+        return bmp;
+    }
+
+    mtmd_media_memo * memo = mtmd_ctx_media_memo(ctx);
+    const uint64_t container_hash = mtmd_media_memo::fnv1a(buf, len);
+
+    mtmd_media_memo_entry ent;
+    if (memo->find(container_hash, ent)) {
+        // warm: identity + token shape are known; skip pixel decoding entirely
+        const bool is_video = len >= 15 && memcmp(buf, "IMAGE_TEMPORAL", 14) == 0;
+        return mtmd_bitmap_init_lazy(ent.nx, ent.ny, ent.nz, is_video, ent.id.c_str(), buf, len, container_hash);
+    }
+
+    // cold: decode now (the pixels are needed to compute the content id anyway);
+    // tokenize will write the memo entry once it knows the token shape
+    mtmd_bitmap * bmp = mtmd_helper_decode_container(buf, len);
+    if (!bmp) {
+        return nullptr;
+    }
+    std::string id = std::to_string(mtmd_media_memo::fnv1a(mtmd_bitmap_get_data(bmp), mtmd_bitmap_get_n_bytes(bmp)));
+    mtmd_bitmap_set_id(bmp, id.c_str());
+    mtmd_bitmap_set_container(bmp, buf, len, container_hash);
+    return bmp;
 }
 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_file(mtmd_context * ctx, const char * fname) {

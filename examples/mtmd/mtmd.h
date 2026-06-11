@@ -150,6 +150,24 @@ MTMD_API void                  mtmd_bitmap_free       (mtmd_bitmap * bitmap);
 MTMD_API const char * mtmd_bitmap_get_id(const mtmd_bitmap * bitmap);
 MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
 
+// lazy media support: bitmaps whose pixel data is never decoded because the
+// media memo (see mtmd-media-memo.h, owned by mtmd_context) already knows the
+// container's identity and token shape. the encoded source bytes are retained
+// so pixels can be materialized at encode time if the chunk needs encoding.
+// init a lazy (pixel-less) bitmap from memoized identity + encoded source bytes
+MTMD_API mtmd_bitmap * mtmd_bitmap_init_lazy(uint32_t nx, uint32_t ny, uint32_t nz,
+                                             bool is_video,
+                                             const char * id,
+                                             const unsigned char * container, size_t container_len,
+                                             uint64_t container_hash);
+// attach encoded source bytes (and their fnv1a hash) to an eagerly-decoded bitmap,
+// making it eligible for memoization at tokenize time
+MTMD_API void mtmd_bitmap_set_container(mtmd_bitmap * bitmap,
+                                        const unsigned char * container, size_t container_len,
+                                        uint64_t container_hash);
+// number of memoized containers (debug/stats)
+MTMD_API size_t mtmd_media_memo_count(mtmd_context * ctx);
+
 
 // mtmd_input_chunks
 //

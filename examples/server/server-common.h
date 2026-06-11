@@ -17,6 +17,13 @@
 
 #include "server-request-trace.h"
 
+// ---- Media-memo stat (separate concern, kept global for now) ----
+// Sampled after mtmd_tokenize in process_mtmd_prompt; printed by
+// maybe_print_media_memo_stats() at the same sites as the preprocess timing.
+inline std::atomic<int64_t> g_media_memo_entries{0};
+
+void maybe_print_media_memo_stats();
+
 
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT

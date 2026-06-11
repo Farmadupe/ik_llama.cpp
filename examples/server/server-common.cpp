@@ -1917,6 +1917,14 @@ std::string fnv_hash(const uint8_t* data, size_t len) {
     return std::to_string(hash);
 }
 
+void maybe_print_media_memo_stats() {
+    int64_t memo_entries = g_media_memo_entries.exchange(0);
+    if (memo_entries > 0) {
+        fprintf(stderr, "media memo stats:\n");
+        fprintf(stderr, "%-39s%8" PRId64 "\n", "* memoized containers:", memo_entries);
+    }
+}
+
 server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files, request_trace* trace) {
     // ---- Temporary instrumentation: sub-stages of "decode images and split inputs" ----
     const int64_t t_mtmd_start = ggml_time_us();
@@ -1925,13 +1933,13 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
 
     mtmd::bitmaps bitmaps;
     for (auto& file : files) {
-        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
+        // memo-aware init: repeat sightings of a container skip pixel decoding
+        // entirely; the bitmap id (pixel-content hash, for KV caching) is set
+        // by the helper in both the warm and cold case
+        mtmd::bitmap bmp(mtmd_helper_bitmap_init_lazy(mctx, file.data(), file.size()));
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
         }
-        // calculate bitmap hash (for KV caching)
-        std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
-        bmp.set_id(hash.c_str());
         bitmaps.entries.push_back(std::move(bmp));
     }
     const int64_t t_mtmd_after_bitmaps = ggml_time_us();
@@ -1962,6 +1970,7 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
                               (int64_t)files.size(),
                               (int64_t)total_file_bytes);
     }
+    g_media_memo_entries.store((int64_t)mtmd_media_memo_count(mctx));
     // ---- End instrumentation ----
 
     auto result = server_tokens(chunks, true);
