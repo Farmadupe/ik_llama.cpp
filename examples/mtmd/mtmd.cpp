@@ -2,6 +2,8 @@
 #include "clip-impl.h"
 #include "mtmd.h"
 #include "mtmd-audio.h"
+#include "mtmd-helper.h"
+#include "mtmd-media-memo.h"
 
 #include "llama.h"
 
@@ -10,36 +12,47 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <stdexcept>
 #include <vector>
 
 // represents raw image data, layout is RGBRGBRGB...
 // length of data must be nz * nx * ny * 3 (frame-major)
 struct mtmd_bitmap {
-    uint32_t nx;
-    uint32_t ny;
-    uint32_t nz;
-    std::vector<unsigned char> data;
+    uint32_t nx = 0;
+    uint32_t ny = 0;
+    uint32_t nz = 1;
+    std::vector<unsigned char> data; // decoded pixels; empty for lazy bitmaps (see container)
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
     bool is_video = false; // true if the bitmap is a temporal/video chunk
+    // encoded source bytes (image file or IMAGE_TEMPORAL container), shared into
+    // chunks so pixels can be materialized at encode time without re-upload
+    std::shared_ptr<const std::vector<unsigned char>> container;
+    uint64_t container_hash = 0; // fnv1a over *container; 0 = no container attached
 };
 
 struct mtmd_image_tokens {
-    uint32_t nx; // number of tokens in x direction
-    uint32_t ny; // number of tokens in y direction
+    uint32_t nx = 0; // number of tokens in x direction
+    uint32_t ny = 0; // number of tokens in y direction
     bool use_mrope_pos = false; // use M-RoPE position counting (the whole image is 1 temporal position)
     uint32_t n_tokens() const { return nx * ny; }
-    clip_image_f32_batch batch_f32; // preprocessed image patches
+    clip_image_f32_batch batch_f32; // preprocessed image patches; empty for lazy chunks (see container)
     std::string id; // optional user-defined ID, useful for KV cache tracking
+    // encoded source bytes; lets an entries-empty (lazy) chunk materialize its
+    // pixels at encode time. reset by mtmd_input_chunk_free_data.
+    std::shared_ptr<const std::vector<unsigned char>> container;
 
     mtmd_image_tokens clone() {
-        return mtmd_image_tokens{
+        mtmd_image_tokens copy{
             nx,
             ny,
             use_mrope_pos,
             batch_f32.clone(),
             id
         };
+        copy.container = container;
+        return copy;
     }
 };
 using mtmd_image_tokens_ptr = std::unique_ptr<mtmd_image_tokens>;
@@ -148,6 +161,10 @@ struct mtmd_context {
 
     // for whisper, we pre-calculate the mel filter bank
     whisper_preprocessor::whisper_filters w_filters;
+
+    // media identity/token-shape memo (see mtmd-media-memo.h); shared so
+    // long-lived holders can outlive a hypothetical context teardown
+    std::shared_ptr<mtmd_media_memo> media_memo = std::make_shared<mtmd_media_memo>();
 
     // TODO @ngxson : add timings
 
@@ -423,6 +440,41 @@ void mtmd_free(mtmd_context * ctx) {
     delete ctx;
 }
 
+mtmd_media_memo * mtmd_ctx_media_memo(mtmd_context * ctx) {
+    return ctx->media_memo.get();
+}
+
+size_t mtmd_media_memo_count(mtmd_context * ctx) {
+    return ctx->media_memo->count();
+}
+
+// run clip_image_preprocess over nz frames of packed RGB data (frame-major),
+// accumulating all entries into one batch. used at tokenize time for eager
+// bitmaps and at encode time for lazy chunks materialized from a container.
+static bool mtmd_preprocess_pixel_frames(clip_ctx * ctx_v,
+                                         const unsigned char * data,
+                                         uint32_t nx, uint32_t ny, uint32_t nz,
+                                         clip_image_f32_batch & out) {
+    const size_t frame_bytes = (size_t)nx * ny * 3;
+    for (uint32_t z = 0; z < nz; z++) {
+        clip_image_u8_ptr img_u8(clip_image_u8_init());
+        img_u8->nx = nx;
+        img_u8->ny = ny;
+        img_u8->buf.resize(frame_bytes);
+        std::memcpy(img_u8->buf.data(), data + (size_t)z * frame_bytes, frame_bytes);
+        clip_image_f32_batch one;
+        if (!clip_image_preprocess(ctx_v, img_u8.get(), &one)) {
+            return false;
+        }
+        out.grid_x = one.grid_x;
+        out.grid_y = one.grid_y;
+        for (auto & entry : one.entries) {
+            out.entries.push_back(std::move(entry));
+        }
+    }
+    return true;
+}
+
 struct mtmd_tokenizer {
     mtmd_context * ctx;
     std::vector<const mtmd_bitmap *> bitmaps;
@@ -548,33 +600,44 @@ struct mtmd_tokenizer {
                 add_text(media_beg, true);
             }
 
-
-            const size_t frame_bytes = (size_t)bitmap->nx * bitmap->ny * 3;
-            auto preprocess_frames = [&](clip_image_f32_batch & out) -> bool {
-                for (uint32_t z = 0; z < bitmap->nz; z++) {
-                    clip_image_u8_ptr img_u8(clip_image_u8_init());
-                    img_u8->nx = bitmap->nx;
-                    img_u8->ny = bitmap->ny;
-                    img_u8->buf.resize(frame_bytes);
-                    std::memcpy(img_u8->buf.data(), bitmap->data.data() + (size_t)z * frame_bytes, frame_bytes);
-                    clip_image_f32_batch one;
-                    if (!clip_image_preprocess(ctx->ctx_v, img_u8.get(), &one)) {
-                        return false;
-                    }
-                    out.grid_x = one.grid_x;
-                    out.grid_y = one.grid_y;
-                    
-                    for (auto & entry : one.entries) {
-                        out.entries.push_back(std::move(entry));
-                    }
+            // lazy bitmap: pixels were never decoded because the media memo
+            // already knew this container's identity and token shape. emit an
+            // identity-only chunk; pixels materialize from the container at
+            // encode time (and not at all if the chunk is prefix-matched).
+            if (bitmap->data.empty()) {
+                mtmd_media_memo_entry ent;
+                if (!bitmap->container || !ctx->media_memo->find(bitmap->container_hash, ent)) {
+                    LOG_ERR("%s: lazy bitmap has no media memo entry\n", __func__);
+                    return 2;
                 }
-                return true;
-            };
+                mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+                if (ctx->use_mrope) {
+                    image_tokens->nx = ent.nx_tok;
+                    image_tokens->ny = ent.ny_tok;
+                    image_tokens->use_mrope_pos = true;
+                } else {
+                    image_tokens->nx = ent.n_tokens;
+                    image_tokens->ny = 1;
+                }
+                image_tokens->id        = bitmap->id;
+                image_tokens->container = bitmap->container;
 
-            // preprocess image
+                mtmd_input_chunk chunk{
+                    MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                    {}, // text tokens
+                    std::move(image_tokens),
+                    nullptr, // audio tokens
+                };
+                cur.entries.emplace_back(std::move(chunk));
+
+                if (!media_end.empty()) {
+                    add_text(media_end, true);
+                }
+                return 0;
+            }
+
             clip_image_f32_batch batch_f32;
-            bool ok = preprocess_frames(batch_f32);
-            if (!ok) {
+            if (!mtmd_preprocess_pixel_frames(ctx->ctx_v, bitmap->data.data(), bitmap->nx, bitmap->ny, bitmap->nz, batch_f32)) {
                 LOG_ERR("Unable to preprocess image\n");
                 return 2;
             }
@@ -661,6 +724,25 @@ struct mtmd_tokenizer {
                 }
                 image_tokens->batch_f32 = std::move(batch_f32);
                 image_tokens->id = bitmap->id; // optional
+                image_tokens->container = bitmap->container;
+
+                // record identity + token shape so future sightings of this
+                // container can skip pixel decoding entirely. blind write:
+                // keys are content hashes, so a racing writer for the same
+                // key always carries identical values.
+                if (bitmap->container_hash != 0) {
+                    mtmd_media_memo_entry ent;
+                    ent.id       = bitmap->id;
+                    ent.nx       = bitmap->nx;
+                    ent.ny       = bitmap->ny;
+                    ent.nz       = bitmap->nz;
+                    ent.n_tokens = (uint32_t) n_tokens;
+                    if (image_tokens->use_mrope_pos) {
+                        ent.nx_tok = image_tokens->nx;
+                        ent.ny_tok = image_tokens->ny;
+                    }
+                    ctx->media_memo->put(bitmap->container_hash, std::move(ent));
+                }
 
                 LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
@@ -826,11 +908,34 @@ static int32_t mtmd_encode_image_into(mtmd_context * ctx, const mtmd_image_token
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
     bool ok = false;
 
+    // lazy chunk: decode the source container and preprocess, scoped to this
+    // call - both the pixels and the f32 batch are dropped on return.
+    clip_image_f32_batch materialized;
+    const clip_image_f32_batch * batch_f32 = &image_tokens->batch_f32;
+    if (batch_f32->entries.empty()) {
+        if (!image_tokens->container) {
+            LOG_ERR("%s: image chunk has no pixel data and no source container (already encoded and freed?)\n", __func__);
+            return 1;
+        }
+        mtmd_bitmap * pixels = mtmd_helper_decode_container(image_tokens->container->data(), image_tokens->container->size());
+        if (!pixels) {
+            LOG_ERR("%s: failed to decode source container\n", __func__);
+            return 1;
+        }
+        bool ok_pp = mtmd_preprocess_pixel_frames(ctx_clip, pixels->data.data(), pixels->nx, pixels->ny, pixels->nz, materialized);
+        mtmd_bitmap_free(pixels);
+        if (!ok_pp) {
+            LOG_ERR("%s: failed to preprocess materialized pixels\n", __func__);
+            return 1;
+        }
+        batch_f32 = &materialized;
+    }
+
     if (clip_is_llava(ctx_clip)
         || clip_is_minicpmv(ctx_clip)
         || clip_is_glm(ctx_clip)) {
         // TODO @ngxson : llava does not support batched encoding ; this should be fixed inside clip_image_batch_encode()
-        const auto & entries = image_tokens->batch_f32.entries;
+        const auto & entries = batch_f32->entries;
         for (size_t i = 0; i < entries.size(); i++) {
             int n_tokens_per_image = clip_n_output_tokens(ctx_clip, entries[i].get());
             ok = clip_image_encode(
@@ -843,7 +948,7 @@ static int32_t mtmd_encode_image_into(mtmd_context * ctx, const mtmd_image_token
         ok = clip_image_batch_encode(
             ctx_clip,
             ctx->n_threads,
-            &image_tokens->batch_f32,
+            batch_f32,
             out);
     }
 
@@ -859,10 +964,9 @@ int32_t mtmd_encode_chunk_into(mtmd_context * ctx, const mtmd_input_chunk * chun
             LOG_ERR("%s: model does not support vision input\n", __func__);
             return 1;
         }
-        // If in the future, we somehow accidentally try to reencode an already-encoded chunk,
-        // chunk->tokens_image will have been cleared out to save memory
-        GGML_ASSERT(!chunk->tokens_image->batch_f32.entries.empty()
-            && "mtmd_encode_chunk_into: image data already released (double encode?)");
+        // entries may be empty for lazy chunks; mtmd_encode_image_into
+        // materializes pixels from the container, and errors if neither pixels
+        // nor container exist (i.e. already encoded and freed).
         return mtmd_encode_image_into(ctx, chunk->tokens_image.get(), out);
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         if (!ctx->ctx_a) {
@@ -954,6 +1058,36 @@ mtmd_bitmap * mtmd_bitmap_init_frames(uint32_t nx,
     bitmap->data.resize(data_size);
     std::memcpy(bitmap->data.data(), data, data_size);
     return bitmap;
+}
+
+mtmd_bitmap * mtmd_bitmap_init_lazy(uint32_t nx,
+                                    uint32_t ny,
+                                    uint32_t nz,
+                                    bool is_video,
+                                    const char * id,
+                                    const unsigned char * container,
+                                    size_t container_len,
+                                    uint64_t container_hash) {
+    GGML_ASSERT(container != nullptr && container_len > 0 && container_hash != 0);
+    mtmd_bitmap * bitmap = new mtmd_bitmap;
+    bitmap->nx = nx;
+    bitmap->ny = ny;
+    bitmap->nz = nz;
+    bitmap->is_video = is_video;
+    if (id) {
+        bitmap->id = id;
+    }
+    bitmap->container = std::make_shared<const std::vector<unsigned char>>(container, container + container_len);
+    bitmap->container_hash = container_hash;
+    return bitmap;
+}
+
+void mtmd_bitmap_set_container(mtmd_bitmap * bitmap,
+                               const unsigned char * container,
+                               size_t container_len,
+                               uint64_t container_hash) {
+    bitmap->container = std::make_shared<const std::vector<unsigned char>>(container, container + container_len);
+    bitmap->container_hash = container_hash;
 }
 
 mtmd_bitmap * mtmd_bitmap_init_from_audio(size_t n_samples,
@@ -1121,10 +1255,11 @@ void mtmd_input_chunk_free_raw_data(mtmd_input_chunk * chunk) {
     }
 
     if (chunk->tokens_image) {
-        chunk->tokens_image->batch_f32 = clip_image_f32_batch{};
+        chunk->tokens_image->batch_f32 = clip_image_f32_batch {};
+        chunk->tokens_image->container.reset();
     }
     if (chunk->tokens_audio) {
-        chunk->tokens_audio->batch_f32 = clip_image_f32_batch{};
+        chunk->tokens_audio->batch_f32 = clip_image_f32_batch {};
     }
 }
 

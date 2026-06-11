@@ -4191,6 +4191,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.task->trace->mark_preprocess_finished();
                             slot.task->trace->print();
                         }
+                        maybe_print_media_memo_stats();
 
                         fprintf(stderr, "prompt tokens: %d total. %d prefill\n",
                                 (int) slot.n_prompt_tokens,
@@ -4252,6 +4253,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.task->trace->mark_preprocess_finished();
                     slot.task->trace->print();
                 }
+                maybe_print_media_memo_stats();
 
                 LOG_VERBOSE("prompt processing progress", {
                     {"id_slot",  slot.id},
