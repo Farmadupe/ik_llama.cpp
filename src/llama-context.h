@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-cparams.h"
 #include "llama-sampling.h"
+#include "llama-ubatch-predictor.h"
 
 #include "llama-spec-features.h"
 
@@ -351,6 +352,16 @@ struct llama_context {
 
     int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     int32_t n_eval   = 0; // number of eval calls
+
+    // Online predictor of prefill ubatch wall time; fed one observation per
+    // completed ubatch of prefill-sized batches.
+    llama_ubatch_predictor prefill_predictor;
+
+    // Prefill tokens the caller still expects to decode, including those in the
+    // next llama_decode call (llama_set_prefill_remaining). llama_decode counts
+    // it down as ubatches complete so its progress log can predict the time
+    // left for the whole request, not just the current batch.
+    uint32_t prefill_tokens_remaining = 0;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_t buf_output = nullptr;
