@@ -1,0 +1,15 @@
+[project]
+name = "test-ubatch-predictor"
+version = "0.0.0"
+description = "Black-box pytest suite for llama_ubatch_predictor, driven by recorded prefill traces."
+requires-python = ">=3.14"
+dependencies = [
+    "pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_ubatch_predictor.py"]

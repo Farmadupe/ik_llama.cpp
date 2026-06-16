@@ -65,6 +65,8 @@ add_library(llama
             llama-delta-net.cpp
             llama-kda.h
             llama-kda.cpp
+            llama-ubatch-predictor.h
+            llama-ubatch-predictor.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
