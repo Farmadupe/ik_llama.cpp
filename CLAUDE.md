@@ -20,7 +20,7 @@
 - **Build with CPU for development.** Use `./farmadupe/scripts/compile.sh --cpu` for normal day-to-day development, to speed up iteration times. 
 
 # JJ
-The users is using JJ for change management.
+The user is using JJ for change management.
 
 # Deferred issues (embd-only decode rounds)
 

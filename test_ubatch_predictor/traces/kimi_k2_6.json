@@ -1,0 +1,20 @@
+{
+  "num_experts": 384,
+  "active_experts": 8,
+  "traces": {
+    "16384": {
+      "traces": [
+        [
+          [{"prior_tokens": 0,      "batch_tokens": 16384, "batch_time": 39.0}],
+          [{"prior_tokens": 16384,  "batch_tokens": 16384, "batch_time": 40.0}],
+          [{"prior_tokens": 32768,  "batch_tokens": 16384, "batch_time": 42.0}],
+          [{"prior_tokens": 49152,  "batch_tokens": 16384, "batch_time": 45.0}],
+          [{"prior_tokens": 65536,  "batch_tokens": 16384, "batch_time": 47.0}],
+          [{"prior_tokens": 81920,  "batch_tokens": 16384, "batch_time": 50.0}],
+          [{"prior_tokens": 98304,  "batch_tokens": 16384, "batch_time": 53.0}],
+          [{"prior_tokens": 114688, "batch_tokens": 7076,  "batch_time": 35.0}]
+        ]
+      ]
+    }
+  }
+}
