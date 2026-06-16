@@ -1104,6 +1104,26 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Predict the wall-clock seconds needed to prefill n_tokens new tokens starting
+    // at sequence position pos0, accounting for the internal ubatch chunking. Uses
+    // the context's online prefill-time predictor, which llama_decode feeds with one
+    // observation per completed ubatch of every prefill-sized batch. Returns 0.0
+    // until at least one such ubatch has been observed.
+    LLAMA_API double llama_predict_prefill_seconds(
+            const struct llama_context * ctx,
+                              uint32_t   n_tokens,
+                             llama_pos   pos0);
+
+    // Tell the context how many prefill tokens the caller still expects to
+    // decode, including the tokens of the next llama_decode call. llama_decode
+    // counts the value down as ubatches complete and uses it to log a predicted
+    // time-to-finish for the whole remaining prefill, which it cannot otherwise
+    // know (it only ever sees one batch). Re-set it before each decode call
+    // during prefill; it is a hint and affects logging only.
+    LLAMA_API void llama_set_prefill_remaining(
+            struct llama_context * ctx,
+                        uint32_t   n_tokens);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

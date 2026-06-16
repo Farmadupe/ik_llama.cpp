@@ -1,0 +1,96 @@
+{
+  "num_experts": 512,
+  "active_experts": 10,
+  "traces": {
+    "3456": {
+      "skip-reason": "we don't have a predictor that can cope with a regime where batch sizes are neither cpu dominated nor bandwidth dominated",
+      "traces": [
+        [
+          [{"prior_tokens": 3,     "batch_tokens": 3456, "batch_time": 25.81}],
+          [{"prior_tokens": 3459,  "batch_tokens": 865,  "batch_time": 18.36}],
+          [{"prior_tokens": 4324,  "batch_tokens": 3456, "batch_time": 26.12}],
+          [{"prior_tokens": 7780,  "batch_tokens": 865,  "batch_time": 17.87}],
+          [{"prior_tokens": 8645,  "batch_tokens": 3456, "batch_time": 26.67}],
+          [{"prior_tokens": 12101, "batch_tokens": 865,  "batch_time": 18.59}],
+          [{"prior_tokens": 12966, "batch_tokens": 3456, "batch_time": 27.07}],
+          [{"prior_tokens": 16422, "batch_tokens": 865,  "batch_time": 19.22}],
+          [{"prior_tokens": 17287, "batch_tokens": 3456, "batch_time": 27.48}],
+          [{"prior_tokens": 20743, "batch_tokens": 865,  "batch_time": 18.75}],
+          [{"prior_tokens": 21608, "batch_tokens": 3456, "batch_time": 27.88}],
+          [{"prior_tokens": 25064, "batch_tokens": 865,  "batch_time": 19.86}],
+          [{"prior_tokens": 25929, "batch_tokens": 403,  "batch_time": 11.82},
+            [
+              [{"prior_tokens": 26363, "batch_tokens": 3456, "batch_time": 28.49}],
+              [{"prior_tokens": 29819, "batch_tokens": 865,  "batch_time": 21.34}],
+              [{"prior_tokens": 30684, "batch_tokens": 3456, "batch_time": 28.99}],
+              [{"prior_tokens": 34140, "batch_tokens": 865,  "batch_time": 19.50}],
+              [{"prior_tokens": 35005, "batch_tokens": 240,  "batch_time": 8.97}]
+            ],
+            [
+              [{"prior_tokens": 26378, "batch_tokens": 3456, "batch_time": 28.59}],
+              [{"prior_tokens": 29834, "batch_tokens": 865,  "batch_time": 19.57}],
+              [{"prior_tokens": 30699, "batch_tokens": 2906, "batch_time": 28.16}]
+            ]
+          ]
+        ]
+      ]
+    },
+    "10000": {
+      "traces": [
+        [
+          [{"prior_tokens": 3,     "batch_tokens": 10000, "batch_time": 33.75}],
+          [{"prior_tokens": 10003, "batch_tokens": 8000,  "batch_time": 33.00}],
+          [{"prior_tokens": 18003, "batch_tokens": 10000, "batch_time": 38.12}],
+          [{"prior_tokens": 28003, "batch_tokens": 8000,  "batch_time": 36.73}],
+          [{"prior_tokens": 36003, "batch_tokens": 10000, "batch_time": 42.54}],
+          [{"prior_tokens": 46003, "batch_tokens": 3053,  "batch_time": 29.81},
+            [
+              [{"prior_tokens": 49069, "batch_tokens": 10000, "batch_time": 45.89}],
+              [{"prior_tokens": 59069, "batch_tokens": 8000,  "batch_time": 43.41}],
+              [{"prior_tokens": 67069, "batch_tokens": 2882,  "batch_time": 31.80}]
+            ],
+            [
+              [{"prior_tokens": 49084, "batch_tokens": 10000, "batch_time": 45.94}],
+              [{"prior_tokens": 59084, "batch_tokens": 3147,  "batch_time": 31.54}]
+            ]
+          ]
+        ]
+      ]
+    },
+    "16384": {
+      "traces": [
+        [
+          [{"prior_tokens": 3,      "batch_tokens": 16384, "batch_time": 38.38}],
+          [{"prior_tokens": 16387,  "batch_tokens": 16384, "batch_time": 41.69}],
+          [{"prior_tokens": 32771,  "batch_tokens": 16384, "batch_time": 45.56}],
+          [{"prior_tokens": 49155,  "batch_tokens": 16384, "batch_time": 49.64}],
+          [{"prior_tokens": 65539,  "batch_tokens": 16384, "batch_time": 53.54}],
+          [{"prior_tokens": 81923,  "batch_tokens": 16384, "batch_time": 57.52}],
+          [{"prior_tokens": 98307,  "batch_tokens": 9652,  "batch_time": 44.64},
+            [
+              [{"prior_tokens": 107996, "batch_tokens": 4862, "batch_time": 33.99}]
+            ],
+            [
+              [{"prior_tokens": 108011, "batch_tokens": 8867, "batch_time": 43.94}],
+              [{"prior_tokens": 116915, "batch_tokens": 1232, "batch_time": 27.79}]
+            ]
+          ]
+        ],
+        [
+          [{"prior_tokens": 14,    "batch_tokens": 16384, "batch_time": 38.07}],
+          [{"prior_tokens": 16398, "batch_tokens": 16384, "batch_time": 41.61}],
+          [{"prior_tokens": 32782, "batch_tokens": 6655,  "batch_time": 30.54}]
+        ],
+        [
+          [{"prior_tokens": 14,    "batch_tokens": 16384, "batch_time": 38.05}],
+          [{"prior_tokens": 16398, "batch_tokens": 9934,  "batch_time": 32.92}],
+          [{"prior_tokens": 26375, "batch_tokens": 16384, "batch_time": 43.93}],
+          [{"prior_tokens": 42759, "batch_tokens": 16384, "batch_time": 47.91}],
+          [{"prior_tokens": 59143, "batch_tokens": 16384, "batch_time": 51.87}],
+          [{"prior_tokens": 75527, "batch_tokens": 16384, "batch_time": 55.82}],
+          [{"prior_tokens": 91911, "batch_tokens": 10146, "batch_time": 44.74}]
+        ]
+      ]
+    }
+  }
+}

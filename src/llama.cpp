@@ -6495,6 +6495,19 @@ static bool prepare_mtp_graph_inputs(
 // return positive int on warning
 // return negative int on error
 //
+// Predict the wall time of prefilling n_tokens starting at sequence position pos0,
+// assuming the usual chunking into ubatches of up to n_ubatch tokens.
+static double llama_predict_prefill_chunked(const llama_ubatch_predictor & predictor,
+        uint32_t n_tokens, llama_pos pos0, uint32_t n_ubatch) {
+    double total = 0.0;
+    for (uint32_t done = 0; done < n_tokens; ) {
+        const uint32_t chunk = std::min(n_ubatch, n_tokens - done);
+        total += predictor.predict_ubatch_seconds(chunk, pos0 + (llama_pos) done);
+        done += chunk;
+    }
+    return total;
+}
+
 static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all) { // TODO: rename back to batch
@@ -6593,8 +6606,25 @@ static int llama_decode_internal(
         }
     }
 
+    // Prefill-time predictor. llama_decode cannot tell prefill from token generation,
+    // so any batch of at least this many tokens is treated as prefill.
+    constexpr uint32_t prefill_predictor_min_batch = 10;
+    const bool predict_prefill = n_tokens_all >= prefill_predictor_min_batch &&
+                                 cparams.mtp_op_type == MTP_OP_NONE;
+    if (predict_prefill) {
+        const llama_pos pos0 = batch_all.pos ? batch_all.pos[0] : batch_all.all_pos_0;
+        // predict_ubatch_seconds returns 0 until the predictor has observed a ubatch, so
+        // a zero total means "not trained yet" - skip the (meaningless) prediction log.
+        const double total = llama_predict_prefill_chunked(lctx.prefill_predictor, n_tokens_all, pos0, n_ubatch);
+        if (total > 0.0) {
+            LLAMA_LOG_INFO("%s: prefill of %u tokens at pos %d: predicted %.2f s\n",
+                    __func__, n_tokens_all, (int) pos0, total);
+        }
+    }
+
     bool warned_qnext_mixed_repeat = false;
     for (uint32_t cur_token = 0; cur_token < n_tokens_all; ) {
+        const int64_t t_ubatch_start_us = ggml_time_us();
 #if IK_PRINT_TIMING
         auto tim1 = ggml_time_us();
 #endif
@@ -6925,6 +6955,36 @@ static int llama_decode_internal(
         tim2 = ggml_time_us();
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
+
+        if (predict_prefill) {
+            // The compute may still be in flight on the backend; wait for it so the
+            // ubatch timing is real. Sync via the scheduler directly: llama_synchronize
+            // would also reset the n_queued_tokens/t_compute_start_us eval stats.
+            ggml_backend_sched_synchronize(lctx.sched);
+            const double t_ubatch = 1e-6*double(ggml_time_us() - t_ubatch_start_us);
+
+            auto & predictor = lctx.prefill_predictor;
+            // First-token position as the sequence offset; a proxy when the ubatch
+            // mixes sequences, exact for the single-sequence prefill this targets.
+            const llama_pos pos0 = u_batch.pos[0];
+
+            const double predicted = predictor.predict_ubatch_seconds(n_tokens, pos0);
+
+            predictor.observe_ubatch(n_tokens, pos0, t_ubatch);
+
+            // Tokens left: the request-level remainder fed by the caller via
+            // llama_set_prefill_remaining, counted down as ubatches complete.
+            // Without that hint, fall back to what is left of this batch.
+            auto & n_fed = lctx.prefill_tokens_remaining;
+            n_fed -= std::min(n_fed, n_tokens);
+            const uint32_t n_remaining = std::max(n_fed, n_tokens_all - (cur_token + n_tokens));
+            const double eta = llama_predict_prefill_chunked(predictor, n_remaining,
+                    pos0 + (llama_pos) n_tokens, n_ubatch);
+
+            LLAMA_LOG_INFO("%s: prefill ubatch of %u tokens at pos %d: %.2f s, predicted %.2f s (%+.1f%%); %u tokens left, predicted %.2f s\n",
+                    __func__, n_tokens, (int) pos0, t_ubatch, predicted,
+                    100.0*(predicted - t_ubatch)/t_ubatch, n_remaining, eta);
+        }
 
         bool reset_previous = false;
         // update the kv ring buffer
@@ -12103,6 +12163,21 @@ int32_t llama_encode(
     }
 
     return ret;
+}
+
+double llama_predict_prefill_seconds(
+        const struct llama_context * ctx,
+                          uint32_t   n_tokens,
+                         llama_pos   pos0) {
+    // Returns 0 until the predictor is trained: llama_predict_prefill_chunked sums
+    // predict_ubatch_seconds(), which is 0 before the first observation.
+    return llama_predict_prefill_chunked(ctx->prefill_predictor, n_tokens, pos0, ctx->cparams.n_ubatch);
+}
+
+void llama_set_prefill_remaining(
+        struct llama_context * ctx,
+                    uint32_t   n_tokens) {
+    ctx->prefill_tokens_remaining = n_tokens;
 }
 
 int32_t llama_decode(
