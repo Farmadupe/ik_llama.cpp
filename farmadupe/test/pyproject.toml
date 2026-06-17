@@ -1,0 +1,15 @@
+[project]
+name = "coalesced-prefill-tests"
+version = "0"
+description = "Smoke tests for the coalesced multimodal prefill path in llama-server."
+requires-python = "==3.14.*"
+dependencies = [
+    "pytest~=8.4",
+    "openai~=1.60",
+    "Pillow~=11.0",
+    "huggingface_hub~=0.27.0",
+    "requests~=2.32",
+]
+
+[tool.pytest.ini_options]
+filterwarnings = ["ignore::pytest.PytestAssertRewriteWarning"]

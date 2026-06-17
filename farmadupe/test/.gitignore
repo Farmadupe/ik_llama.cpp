@@ -1,0 +1,8 @@
+models/
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+uv.lock
+bench_logs/
+*.log
