@@ -1068,7 +1068,7 @@ bool llama_model_loader::load_all_data(
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // Number of worker threads for cuda and host tensor loading.
-    const int n_workers = 8;
+    const int n_workers = 16;
 
 #if defined(GGML_USE_CUDA)
     constexpr size_t n_buffers = 4;
