@@ -8196,7 +8196,7 @@ struct llama_model * llama_model_load_from_file(
             unsigned percentage = (unsigned) (100 * progress);
             while (percentage > *cur_percentage_p) {
                 *cur_percentage_p = percentage;
-                LLAMA_LOG_INFO(".");
+                LLAMA_LOG_INFO("%u%%\n", percentage);
                 if (percentage >= 100) {
                     LLAMA_LOG_INFO("\n");
                 }
