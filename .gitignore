@@ -162,3 +162,10 @@ a.out
 a.out.*
 .dev
 .github
+.clangd
+
+build/
+.venv/
+__pycache__/
+.pytest_cache/
+uv.lock

@@ -289,7 +289,7 @@ static json format_embeddings_response_oaicompat(const json& request, const json
 
 static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
     // skip GH copilot requests when using default port
-    if (req.path == "/v1/health" || req.path == "/v1/completions") {
+    if (req.path == "/v1/health" || req.path == "/v1/completions" || req.path == "/v1/models") {
         return;
     }
 
