@@ -35,8 +35,8 @@
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include "stb/stb_image_resize2.h"
 
-#define LOG_INF(...) fprintf(stdout, __VA_ARGS__)
-#define LOG_ERR(...) fprintf(stderr, __VA_ARGS__)
+#define LOG_INF(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while (0)
+#define LOG_ERR(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while (0)
 
 size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks) {
     size_t n_tokens = 0;

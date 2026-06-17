@@ -1,0 +1,7 @@
+CompileFlags:
+  CompilationDatabase: build
+Diagnostics:
+  UnusedIncludes: None
+  Suppress: [misleading-indentation, shadow, unreachable-code-break]
+  ClangTidy:
+    Remove: [readability-misleading-indentation, misc-misleading-indentation]
