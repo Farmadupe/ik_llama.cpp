@@ -1133,7 +1133,8 @@ int main(int argc, char ** argv) {
         const std::vector<raw_buffer>& files,
         const std::function<bool()>& is_connection_closed,
         httplib::Response& res,
-        oaicompat_type oaicompat) -> void {
+        oaicompat_type oaicompat,
+        const std::shared_ptr<request_trace>& trace) -> void {
             GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
             const auto completion_id = gen_chatcmplid();
@@ -1151,12 +1152,13 @@ int main(int argc, char ** argv) {
 
                 if (oaicompat && ctx_server.mctx != nullptr) {
                     // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-                    inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+                    inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, trace.get()));
                 }
                 else {
                     // Everything else, including multimodal completions.
-                    inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
+                    inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true, trace.get());
                 }
+                if (trace) trace->mark_post_tokenize();
                 tasks.reserve(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);
@@ -1171,6 +1173,7 @@ int main(int argc, char ** argv) {
 
                     task.tokens = std::move(inputs[i]);
                     task.data = data;
+                    task.trace = trace; // shared across all sub-tasks of this request
                     //task.params = server_task::params_from_json_cmpl(
                     //    ctx_server.ctx,
                     //    ctx_server.params,
@@ -1304,6 +1307,8 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_completions = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        auto trace = std::make_shared<request_trace>();
+        trace->mark_request_received();
         log_prompt(ctx_server.params_base, json::parse(req.body), req.body.size());
         auto data = json::parse(req.body);
         std::vector<raw_buffer> files; // dummy
@@ -1313,10 +1318,13 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_NONE);
+            OAICOMPAT_TYPE_NONE,
+            trace);
     };
 
     const auto handle_completions_oai = [&ctx_server, &handle_completions_impl](const httplib::Request& req, httplib::Response& res) {
+        auto trace = std::make_shared<request_trace>();
+        trace->mark_request_received();
         log_prompt(ctx_server.params_base, json::parse(req.body), req.body.size());
         auto body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(body);
@@ -1327,7 +1335,8 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_COMPLETION);
+            OAICOMPAT_TYPE_COMPLETION,
+            trace);
     };
 
     const auto handle_models = [&params, &model_meta](const httplib::Request & req, httplib::Response & res) {
@@ -1394,35 +1403,44 @@ int main(int argc, char ** argv) {
 
 
     const auto handle_chat_completions = [&ctx_server, &params, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        auto trace = std::make_shared<request_trace>();
+        trace->mark_request_received();
         log_prompt(ctx_server.params_base, json::parse(req.body), req.body.size());
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
-        json data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        json data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files, trace.get());
+        trace->mark_post_template();
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_CHAT);
+            OAICOMPAT_TYPE_CHAT,
+            trace);
     };
 
     const auto handle_responses = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        auto trace = std::make_shared<request_trace>();
+        trace->mark_request_received();
         log_prompt(ctx_server.params_base, json::parse(req.body), req.body.size());
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json body_parsed = server_chat_convert_responses_to_chatcmpl(body);
-        json data = oaicompat_chat_params_parse(body_parsed, ctx_server.chat_params, files);
+        json data = oaicompat_chat_params_parse(body_parsed, ctx_server.chat_params, files, trace.get());
         handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_RESP);
+            OAICOMPAT_TYPE_RESP,
+            trace);
     };
 
     const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        auto trace = std::make_shared<request_trace>();
+        trace->mark_request_received();
         std::vector<raw_buffer> files;
         log_prompt(ctx_server.params_base, json::parse(req.body), req.body.size());
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
@@ -1431,14 +1449,16 @@ int main(int argc, char ** argv) {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             ctx_server.chat_params,
-            files);
+            files,
+            trace.get());
         return handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_ANTHROPIC);
+            OAICOMPAT_TYPE_ANTHROPIC,
+            trace);
     };
 
     const auto handle_anthropic_count_tokens = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
@@ -1467,6 +1487,8 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_infill = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        auto trace = std::make_shared<request_trace>();
+        trace->mark_request_received();
         log_prompt(ctx_server.params_base, json::parse(req.body), req.body.size());
         json data = json::parse(req.body);
         //avoid double submits
@@ -1481,7 +1503,8 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_NONE); // infill is not OAI compatible
+            OAICOMPAT_TYPE_NONE, // infill is not OAI compatible
+            trace);
     };
 
     const auto handle_tokenize = [&ctx_server](const httplib::Request & req, httplib::Response & res) {
