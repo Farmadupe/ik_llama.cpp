@@ -1115,6 +1115,10 @@ int32_t server_context::populate_vocab_pieces() {
 }
 
 bool server_context::launch_slot_with_task(server_slot& slot, server_task& task) {
+    // Record the slot-launch checkpoint into the per-request trace. Written here on
+    // the worker thread, while `task` is still mutable (before it is moved into the
+    // const slot.task); the worker later prints through slot.task->trace.
+    if (task.trace) task.trace->mark_slot_launch();
     slot_params defaults;
     defaults.speculative = params_base.speculative;
 
@@ -4178,6 +4182,18 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             continue;
                         }
                         slot.mm_stream_start = slot.n_past_prompt;
+
+                        // Boundary: the stream is created once per request, right
+                        // before its first drain into a decode - the request's
+                        // first forward pass.
+                        if (slot.task && slot.task->trace) {
+                            slot.task->trace->mark_preprocess_finished();
+                            slot.task->trace->print();
+                        }
+
+                        fprintf(stderr, "prompt tokens: %d total. %d prefill\n",
+                                (int) slot.n_prompt_tokens,
+                                (int) (slot.n_prompt_tokens - slot.n_past_prompt));
                     }
                     drain_pending.push_back(&slot);
                     continue; // stream slots contribute no text-loop rows
@@ -4225,6 +4241,16 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 }
                 slot.prompt_batch_i0 = prompt_batch_i0;
                 slot.prompt_batch_i1 = batch.n_tokens;
+
+                // Boundary: this slot's prefill tokens are now in the batch that is
+                // about to be decoded. Guard on it having actually contributed tokens
+                // this round so a slot bumped to next batch (n_parallel > 1) isn't
+                // stamped early. First-write-wins + idempotent print => fires once,
+                // right before the first prefill forward pass.
+                if (slot.prompt_batch_i1 > prompt_batch_i0 && slot.task && slot.task->trace) {
+                    slot.task->trace->mark_preprocess_finished();
+                    slot.task->trace->print();
+                }
 
                 LOG_VERBOSE("prompt processing progress", {
                     {"id_slot",  slot.id},

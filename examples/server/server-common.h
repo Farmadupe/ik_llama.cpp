@@ -15,6 +15,7 @@
 #include <cinttypes>
 #include <deque>
 
+#include "server-request-trace.h"
 
 
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
@@ -298,7 +299,8 @@ struct server_chat_params {
 json oaicompat_chat_params_parse(
     json& body, /* openai api json semantics */
     const server_chat_params& opt,
-    std::vector<raw_buffer>& out_files);
+    std::vector<raw_buffer>& out_files,
+    request_trace* trace = nullptr);
 
 
 //
@@ -497,7 +499,7 @@ public:
 // Computes FNV-1a hash of the data
 std::string fnv_hash(const uint8_t* data, size_t len);
 
-server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files);
+server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files, request_trace* trace = nullptr);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -508,7 +510,7 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
  * - "prompt": [12, 34, "string", 56, 78]
  * - "prompt": { "prompt_string": "string", "multimodal_data": [ "base64" ] }
  */
-server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special);
+server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special, request_trace* trace = nullptr);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -523,7 +525,7 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
  * - "prompt": [[12, 34, 56], [78, 90, 12]]
  * - "prompt": [[12, 34, "string", 56, 78], [12, 34, 56], { "prompt_string": "string", "multimodal_data": [ "base64" ]}]
  */
-std::vector<server_tokens> tokenize_input_prompts(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special);
+std::vector<server_tokens> tokenize_input_prompts(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special, request_trace* trace = nullptr);
 
 // Assuming raw_buffer has .data() and .size() members
 void print_files_info(const std::vector<raw_buffer>& files);
