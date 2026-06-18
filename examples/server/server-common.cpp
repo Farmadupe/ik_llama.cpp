@@ -629,7 +629,8 @@ json oaicompat_chat_params_parse(const json& body) {
 json oaicompat_chat_params_parse(
     json& body, /* openai api json semantics */
     const server_chat_params& opt,
-    std::vector<raw_buffer>& out_files)
+    std::vector<raw_buffer>& out_files,
+    request_trace* trace)
 {
     json llama_params;
 
@@ -750,7 +751,9 @@ json oaicompat_chat_params_parse(
                     }
                     else {
                         auto base64_data = parts[1];
+                        const int64_t t_b64 = ggml_time_us();
                         auto decoded_data = base64_decode(base64_data);
+                        if (trace) trace->add_base64_us(ggml_time_us() - t_b64);
                         out_files.push_back(decoded_data);
                     }
                 }
@@ -772,7 +775,9 @@ json oaicompat_chat_params_parse(
                 if (format != "wav" && format != "mp3") {
                     throw std::runtime_error("input_audio.format must be either 'wav' or 'mp3'");
                 }
+                const int64_t t_b64 = ggml_time_us();
                 auto decoded_data = base64_decode(data); // expected to be base64 encoded
+                if (trace) trace->add_base64_us(ggml_time_us() - t_b64);
                 out_files.push_back(decoded_data);
 
                 p["type"] = "media_marker";
@@ -1855,7 +1860,12 @@ std::string fnv_hash(const uint8_t* data, size_t len) {
     return std::to_string(hash);
 }
 
-server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files) {
+server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files, request_trace* trace) {
+    // ---- Temporary instrumentation: sub-stages of "decode images and split inputs" ----
+    const int64_t t_mtmd_start = ggml_time_us();
+    size_t total_file_bytes = 0;
+    for (const auto& f : files) total_file_bytes += f.size();
+
     mtmd::bitmaps bitmaps;
     for (auto& file : files) {
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
@@ -1867,6 +1877,7 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
         bmp.set_id(hash.c_str());
         bitmaps.entries.push_back(std::move(bmp));
     }
+    const int64_t t_mtmd_after_bitmaps = ggml_time_us();
     // process prompt
     std::vector<server_tokens> inputs;
     // multimodal
@@ -1885,6 +1896,17 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
+    const int64_t t_mtmd_after_tokenize = ggml_time_us();
+
+    // Publish to the per-request trace (printed before first decode).
+    if (trace) {
+        trace->set_mtmd_stats(t_mtmd_after_bitmaps - t_mtmd_start,
+                              t_mtmd_after_tokenize - t_mtmd_after_bitmaps,
+                              (int64_t)files.size(),
+                              (int64_t)total_file_bytes);
+    }
+    // ---- End instrumentation ----
+
     auto result = server_tokens(chunks, true);
     return result;
 }
@@ -1898,7 +1920,7 @@ server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::v
  * - "prompt": [12, 34, "string", 56, 78]
  * - "prompt": { "prompt_string": "string", "multimodal_data": [ "base64" ] }
  */
-server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special) {
+server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special, request_trace* trace) {
     constexpr char JSON_STRING_PROMPT_KEY[] = "prompt_string";
     constexpr char JSON_MTMD_DATA_KEY[] = "multimodal_data";
     const bool has_mtmd = mctx != nullptr;
@@ -1921,9 +1943,12 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
             // JSON object with prompt and multimodal key.
             std::vector<raw_buffer> files;
             for (const auto& entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
-                files.push_back(base64_decode(entry));
+                const int64_t t_b64 = ggml_time_us();
+                auto decoded = base64_decode(entry);
+                if (trace) trace->add_base64_us(ggml_time_us() - t_b64);
+                files.push_back(std::move(decoded));
             }
-            return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
+            return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files, trace);
         }
         else {
             // Not multimodal, but contains a subobject.
@@ -1949,16 +1974,16 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
  * - "prompt": [[12, 34, 56], [78, 90, 12]]
  * - "prompt": [[12, 34, "string", 56, 78], [12, 34, 56], { "prompt_string": "string", "multimodal_data": [ "base64" ]}]
  */
-std::vector<server_tokens> tokenize_input_prompts(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special) {
+std::vector<server_tokens> tokenize_input_prompts(const llama_vocab* vocab, mtmd_context* mctx, const json& json_prompt, bool add_special, bool parse_special, request_trace* trace) {
     std::vector<server_tokens> result;
     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {
         result.reserve(json_prompt.size());
         for (const auto& p : json_prompt) {
-            result.push_back(tokenize_input_subprompt(vocab, mctx, p, add_special, parse_special));
+            result.push_back(tokenize_input_subprompt(vocab, mctx, p, add_special, parse_special, trace));
         }
     }
     else {
-        result.push_back(tokenize_input_subprompt(vocab, mctx, json_prompt, add_special, parse_special));
+        result.push_back(tokenize_input_subprompt(vocab, mctx, json_prompt, add_special, parse_special, trace));
     }
     if (result.empty()) {
         throw std::runtime_error("\"prompt\" must not be empty");

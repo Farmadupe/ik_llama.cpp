@@ -5,8 +5,10 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <memory>
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-request-trace.h"
 
 using json = nlohmann::ordered_json;
 
@@ -93,6 +95,11 @@ struct server_task {
 
     server_task_type type;
     json data;
+
+    // Per-request preprocessing instrumentation. Created at HTTP entry, shared by
+    // every sub-task of the request; rides the queue handoff into slot.task and is
+    // read/printed on the worker thread. Null for non-inference tasks (e.g. CANCEL).
+    std::shared_ptr<request_trace> trace;
 
     bool infill = false;
     bool embedding = false;
