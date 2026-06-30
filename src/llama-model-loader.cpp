@@ -1071,12 +1071,13 @@ bool llama_model_loader::load_all_data(
     const int n_workers = 8;
 
 #if defined(GGML_USE_CUDA)
-    // One pinned staging buffer per worker for async uploads
-    constexpr size_t buffer_size = 16 * 1024 * 1024; // 16MB
+    constexpr size_t n_buffers = 4;
+    constexpr size_t buffer_size = 4 * 1024 * 1024; // 4MB * 4MB per thread.
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<void*> host_ptrs;
     std::vector<ggml_backend_event_t> events;
+    std::vector<size_t> buffer_idx(n_workers, 0);
 
     ggml_backend_t cuda_backend = nullptr;
     if (!use_mmap && !check_tensors) {
@@ -1096,7 +1097,7 @@ bool llama_model_loader::load_all_data(
 
         // If the cuda backend is active create pinned memory buffers and events for synchronisation.
         if (cuda_backend) {
-            for (size_t idx = 0; idx < (size_t)n_workers; ++idx) {
+            for (size_t idx = 0; idx < (size_t)n_workers * n_buffers; ++idx) {
                 host_buffers.emplace_back(ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), buffer_size));
                 host_ptrs.emplace_back(ggml_backend_buffer_get_base(host_buffers[idx]));
                 events.emplace_back(ggml_backend_event_new(cuda_backend));
@@ -1182,12 +1183,15 @@ bool llama_model_loader::load_all_data(
             while (bytes_read < n_size) {
                 size_t read_iteration = std::min<size_t>(buffer_size, n_size - bytes_read);
 
-                ggml_backend_event_synchronize(events[thread_idx]);
-                file->read_raw(host_ptrs[thread_idx], read_iteration);
-                ggml_backend_tensor_set_async(cuda_backend, cur, host_ptrs[thread_idx], bytes_read, read_iteration);
-                ggml_backend_event_record(events[thread_idx]);
+                size_t buf = thread_idx * n_buffers + buffer_idx[thread_idx];
+                ggml_backend_event_synchronize(events[buf]);
+                file->read_raw(host_ptrs[buf], read_iteration);
+                ggml_backend_tensor_set_async(cuda_backend, cur, host_ptrs[buf], bytes_read, read_iteration);
+                ggml_backend_event_record(events[buf]);
 
                 bytes_read += read_iteration;
+                buffer_idx[thread_idx]++;
+                buffer_idx[thread_idx] %= n_buffers;
             }
             return n_size;
         }
@@ -1281,7 +1285,7 @@ bool llama_model_loader::load_all_data(
 #if defined(GGML_USE_CUDA)
     // free temporary resources used for async cuda uploads
     if (cuda_backend) {
-        for (size_t idx = 0; idx < (size_t)n_workers;++idx) {
+        for (size_t idx = 0; idx < (size_t)n_workers * n_buffers;++idx) {
             ggml_backend_event_synchronize(events[idx]);
             ggml_backend_event_free(events[idx]);
             ggml_backend_buffer_free(host_buffers[idx]);
