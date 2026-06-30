@@ -1445,29 +1445,87 @@ static void * ggml_cuda_host_malloc(size_t size) {
         return nullptr;
     }
 
-    // Whether to request the kernel to attempt to defragment memory to back the region with 2M hugepages.
-    // Otherwise dependent on kernel settings:
-    //   * enabled="always":  Hand over whatever 2M pages it has on hand and the rest will be 4k 
-    //   * enabled="madvise": 4k pages
-    //   * enabled="never":   4k pages
-    // Potluck on performance. If there's not much defragmentation to do, then you win. Otherwise come back in an hour.
-    // Defaults to disabled unless GGML_CUDA_HOST_MALLOC_THP is set.
-    if (getenv("GGML_CUDA_HOST_MALLOC_THP") != nullptr) {
-        madvise(ptr, size, MADV_HUGEPAGE);
-    }
+    // Try to back the region with 2M transparent hugepages (THP). On a kernel set to
+    // thp=madvise / defrag=madvise this is a big win when memory is unfragmented, but when
+    // it is fragmented the kernel does direct compaction in the fault path and throughput
+    // collapses (the "compaction wall") - prefaulting a huge region can stall for minutes.
+    //
+    // So instead of committing to THP up front, default to "auto": hint THP, then prefault
+    // in chunks while measuring throughput. If the aggregate throughput of the last few
+    // chunks drops below a threshold we take that as a sign we've hit the compaction wall,
+    // tell the kernel we changed our mind about THP for the not-yet-faulted remainder
+    // (MADV_NOHUGEPAGE only affects future faults, so the fast huge chunks we already got
+    // are kept) and finish in 4k mode. Not preemptive: we only react once we feel the wall.
+    //
+    // Setting GGML_CUDA_HOST_MALLOC_THP forces THP for the whole region with no back-off
+    // (the previous behavior of this env var). thp tracks whether we are still adaptively
+    // watching: true in auto mode until we give up, false in forced mode (we never watch -
+    // the MADV_HUGEPAGE hint below just stands) and false once auto mode backs off to 4k.
+    bool auto_thp = true;
+    bool force_thp = getenv("GGML_CUDA_HOST_MALLOC_THP") != nullptr;
+
+    // Tunables (compile-time only, no env vars). The chunk size is a multiple of 2M so
+    // chunk boundaries never split a hugepage.
+    constexpr uint64_t k_thp_chunk   = 64ull * 1024 * 1024;      // chunk size
+    constexpr int      k_thp_window  = 4;                        // aggregate over the last N chunks
+    constexpr int64_t  k_thp_min_bps = 4ll * 1024 * 1024 * 1024; // 4GiB: give up on THP below this
+
+    madvise(ptr, size, MADV_HUGEPAGE);
+
+    auto throughput_bps = [] {
+        int64_t prev = ggml_time_us();
+        std::array<int64_t, k_thp_window> win_us{};
+        int n = 0;
+        return [prev, win_us, n]() mutable -> int64_t {
+            const int64_t now = ggml_time_us();
+            win_us[n % k_thp_window] = now - prev;
+            prev = now;
+            ++n;
+            if (n < k_thp_window) {
+                return -1;
+            }
+            int64_t agg_us = 0;
+            for (int i = 0; i < k_thp_window; ++i) {
+                agg_us += win_us[i];
+            }
+            if (agg_us <= 0) {
+                return -1;
+            }
+            return k_thp_window * (int64_t)k_thp_chunk * 1000000 / agg_us;
+        };
+    }();
 
     // prefault the whole region. If the kernel knows how to do this then let it do so.
     // Might be worth spawning threads to speed up this process on huge allocations.
-    int needs_manual_prefault = 1;
+    for (uint64_t base = 0; base < size; base += k_thp_chunk) {
+        const uint64_t len = std::min<uint64_t>(k_thp_chunk, size - base);
+        char * p = (char *) ptr + base;
+
+        int needs_manual_prefault = 1;
 #ifdef MADV_POPULATE_WRITE
-    needs_manual_prefault = madvise(ptr, size, MADV_POPULATE_WRITE);
+        needs_manual_prefault = madvise(p, len, MADV_POPULATE_WRITE);
 #endif
-    if (needs_manual_prefault) {
-        char * p = (char *) ptr;
-        for (size_t off = 0; off < size; off += 4096) {
-            p[off] = 0;
+        if (needs_manual_prefault) {
+            for (uint64_t off = 0; off < len; off += 4096) {
+                p[off] = 0;
+            }
+        }
+
+        // Auto mode: watch for the compaction wall and back off to 4k for the rest.
+        if (auto_thp && !force_thp) {
+            const int64_t bps = throughput_bps();
+            if (bps >= 0 && bps < k_thp_min_bps) {
+                const uint64_t rest_off = base + len;
+                if (rest_off < size) {
+                    madvise((char *) ptr + rest_off, size - rest_off, MADV_NOHUGEPAGE);
+                }
+                auto_thp = false;
+                GGML_CUDA_LOG_INFO("    THP prefault slow (%.2f GB/s), switching to 4k pages for the remaining %.2f GiB\n",
+                                   bps/1e9, (size - rest_off)/(1024.*1024.*1024.));
+            }
         }
     }
+
 
     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable);
     if (err != cudaSuccess) {
