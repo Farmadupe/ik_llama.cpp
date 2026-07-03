@@ -207,20 +207,18 @@ MTMD_API int32_t mtmd_tokenize(mtmd_context * ctx,
                                const mtmd_bitmap ** bitmaps,
                                size_t n_bitmaps);
 
+// encode a media chunk, writing the encoded rows into a caller-provided
+// buffer. out must have room for at least:
+//   llama_model_n_embd(model) * mtmd_input_chunk_get_n_tokens(chunk) floats
 // returns 0 on success
-// TODO: deprecate
-MTMD_API int32_t mtmd_encode(mtmd_context * ctx,
-                             const mtmd_image_tokens * image_tokens);
+MTMD_API int32_t mtmd_encode_chunk_into(mtmd_context * ctx,
+                                        const mtmd_input_chunk * chunk,
+                                        float * out);
 
-// returns 0 on success
-MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
-                                   const mtmd_input_chunk * chunk);
-
-// get output embeddings from the last encode pass
-// the reading size (in bytes) is equal to:
-// llama_model_n_embd(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
-MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 MTMD_API mtmd_input_chunk * mtmd_create_input_chunk(void);
+// create a standalone text chunk owning a copy of the given tokens;
+// free it with mtmd_input_chunk_free()
+MTMD_API mtmd_input_chunk * mtmd_input_chunk_init_text(const llama_token * tokens, size_t n_tokens);
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_from_json(json & j);
 MTMD_API void mtmd_input_chunk_to_json(mtmd_input_chunk * chunk, json & j);
 
