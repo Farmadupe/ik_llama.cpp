@@ -71,9 +71,10 @@ struct mtmd_helper_coalesce_input {
     const mtmd_input_chunk * chunk;
 };
 
-// Coalesced eval: builds ONE contiguous embedding buffer for the entire input
-// (text rows from the model's input-embedding LUT, image/audio rows from mtmd_encode_chunk)
-// and submits it via a single embd-batch llama_decode, split internally by n_batch.
+// Coalesced eval: streams the entire input (text rows from the model's input-embedding
+// LUT, image/audio rows from mtmd_encode_chunk) through embd-batch llama_decode calls of
+// up to n_batch rows each. At most one batch of embedding rows is reified at a time;
+// inputs (including images) may straddle batch boundaries.
 //
 // Use this to avoid the degenerate 2N+1 tiny batches you get from per-chunk dispatch when
 // a prompt contains many small images. Does NOT support non-causal-attention models - caller
