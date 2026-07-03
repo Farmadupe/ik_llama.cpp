@@ -153,6 +153,15 @@ struct server_slot {
     // multimodal
     mtmd_context* mctx = nullptr;
 
+    // multimodal prefill stream (server-owned decode path); non-null only
+    // while this slot has media prefill in flight
+    mtmd_helper_embd_stream * mm_stream = nullptr;
+    // prompt token index at stream creation; absolute mirror boundary =
+    // mm_stream_start + mtmd_helper_embd_stream_last_chunk_boundary()
+    int32_t mm_stream_start = 0;
+    // rows were drained into the current round; mirror after decode
+    bool mm_mirror_pending = false;
+
     // speculative decoding
     struct common_speculative * spec = nullptr;
     struct common_params_sampling sparams;
@@ -254,6 +263,15 @@ struct server_context {
 
     // multimodal
     mtmd_context* mctx = nullptr;
+
+    // embd staging for decode rounds. Every round decodes as embd rows:
+    // token rows staged in the llama_batch above are converted through
+    // llama_input_embeddings, media rows are drained from per-slot mtmd
+    // streams, and both land here.
+    std::vector<float> embd_data;                       // capacity x n_embd floats
+    std::unique_ptr<mtmd_decode_embd_batch> batch_embd; // pos planes / seq / logits over embd_data
+    bool    round_non_causal = false; // dedicated solo media round (gemma3 family)
+    int32_t round_n_rows     = 0;     // total rows this round (token rows + drained rows)
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -367,6 +385,12 @@ struct server_context {
     void add_sampled_tokens();
 
     void batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type);
+
+    // Build a dedicated non-causal embd round (gemma3 family): whole media
+    // chunks parked at the head of slot streams, at most one chunk per slot
+    // (two chunks of one sequence in a single non-causal ubatch would attend
+    // to each other). Returns false if no chunk was packed.
+    bool build_non_causal_round(const int32_t n_ubatch);
 
     void process_batch_tokens(int32_t & n_batch);
 

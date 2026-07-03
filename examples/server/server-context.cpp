@@ -50,22 +50,6 @@ static bool server_slot_prompt_batch_overlaps(
 
     return slot.prompt_batch_i0 < batch_i1 && batch_i0 < slot.prompt_batch_i1;
 }
-struct server_mtp_warmup {
-    llama_context * ctx_tgt;
-    server_slot   * slot;
-};
-
-static int32_t server_mtp_media_warmup_callback(void * user_data, const llama_batch * batch) {
-    auto * data = static_cast<server_mtp_warmup *>(user_data);
-    if (data == nullptr || data->slot == nullptr) {
-        return 0;
-    }
-
-    return batch != nullptr
-        ? common_speculative_on_target_seq_batch(data->slot->spec, data->ctx_tgt, *batch, data->slot->id, true)
-        : 0;
-}
-
 static bool server_response_needs_chat_parse(oaicompat_type oaicompat) {
     return oaicompat == OAICOMPAT_TYPE_CHAT ||
         oaicompat == OAICOMPAT_TYPE_ANTHROPIC ||
@@ -243,17 +227,6 @@ bool server_context::load_model(const gpt_params& params_) {
         }
         LOG_INFO("loaded multimodal model, %s\n", mmproj_path.c_str());
 
-        // Models that use non-causal attention for iamges in the LM decoder (Gemma3, Gemma4)
-        // need one-batch-per-image. 
-        // The coalesced prefill path does not guarantee this
-        if (mtmd_decode_use_non_causal(mctx)) {
-            LLAMA_LOG_ERROR("%s: multimodal model requires non-causal attention for image tokens, "
-                            "which is not supported by the coalesced prefill path. Refusing to start.\n",
-                            __func__);
-            mtmd_free(mctx);
-            mctx = nullptr;
-            return false;
-        }
         // Self-extend (group attention) remaps token positions during prefill. The deleted
         // text-token loop honored slot.ga_n / ga_w / ga_i; the coalesced path's position
         // assignment doesn't replicate that remapping. Refuse to start with both enabled.
@@ -406,6 +379,17 @@ void server_context::init() {
 
         // only a single seq_id per token is needed
         batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+
+        {
+            // embd staging for decode rounds; same capacity as the token
+            // batch so token-row conversion can never overflow
+            const int32_t cap       = std::max(n_batch, params_base.n_parallel);
+            const int     n_embd    = llama_model_n_embd(model);
+            const auto    rope_type = llama_rope_type(model);
+            const int     n_pos_per = (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+            embd_data.resize((size_t) cap * n_embd);
+            batch_embd = std::make_unique<mtmd_decode_embd_batch>(embd_data.data(), cap, n_pos_per, n_embd);
+        }
     }
 
     metrics.init();
@@ -505,6 +489,12 @@ void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_to
 }
 
 void server_slot::reset() {
+    if (mm_stream) {
+        mtmd_helper_embd_stream_free(mm_stream);
+        mm_stream = nullptr;
+    }
+    mm_stream_start   = 0;
+    mm_mirror_pending = false;
     n_prompt_tokens = 0;
     last_gentxt_size = 0;
     generated_text = "";
@@ -652,6 +642,11 @@ int server_slot::get_n_draft_max() const {
 }
 
 void server_slot::release() {
+    if (mm_stream) {
+        mtmd_helper_embd_stream_free(mm_stream);
+        mm_stream = nullptr;
+    }
+    mm_mirror_pending = false;
     if (state == SLOT_STATE_PROCESSING) {
         t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
         command = SLOT_COMMAND_RELEASE;
@@ -1372,6 +1367,30 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     // get prompt
     if (!task.infill) {
         slot.prompt_tokens = std::move(task.tokens);
+
+        if (mctx && mtmd_decode_use_non_causal(mctx)) {
+            // Non-causal media chunks (gemma3 family) are decoded whole in a
+            // single micro-batch; reject any chunk that cannot fit.
+            const int32_t n_ubatch = llama_n_ubatch(ctx);
+            const size_t  n_toks   = (size_t) slot.prompt_tokens.n_tokens();
+            for (size_t i = 0; i < n_toks; ) {
+                if (slot.prompt_tokens[i] == LLAMA_TOKEN_NULL) {
+                    const auto & chunk = slot.prompt_tokens.find_chunk(i);
+                    const size_t n_chunk_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
+                    if ((int32_t) n_chunk_tokens > n_ubatch) {
+                        send_error(task, "media chunk requires " + std::to_string(n_chunk_tokens) +
+                                         " tokens but the physical batch size (n_ubatch) is only " +
+                                         std::to_string(n_ubatch) + "; non-causal multimodal models need "
+                                         "the whole chunk in one micro-batch - increase -ub",
+                                   ERROR_TYPE_INVALID_REQUEST);
+                        return false;
+                    }
+                    i += n_chunk_tokens;
+                } else {
+                    i++;
+                }
+            }
+        }
 
         const auto & prompt = data.find("prompt");
         if (prompt != data.end()) {
@@ -2600,7 +2619,7 @@ void server_context::send_embedding(const server_slot& slot, const llama_batch& 
         }
 
         if (embd == nullptr) {
-            SLT_ERR(slot, "failed to get embeddings, token = %d, seq_id = %d\n", batch.token[i], batch.seq_id[i][0]);
+            SLT_ERR(slot, "failed to get embeddings, seq_id = %d\n", batch.seq_id[i][0]);
 
             res->embedding.push_back(std::vector<float>(n_embd, 0.0f));
             continue;
@@ -3811,6 +3830,12 @@ static std::list<server_prompt_checkpoint>::iterator evict_checkpoint_by_varianc
 
 bool server_context::create_checkpoint(server_slot & slot) {
     bool do_checkpoint = !slot.image_just_processed;
+    // never checkpoint while a multimodal stream has a partially decoded
+    // chunk: the KV then holds rows past cache_tokens, and a checkpoint
+    // captured here would be reconstructed inconsistently by size_up_to_pos
+    do_checkpoint = do_checkpoint && !(slot.mm_stream != nullptr
+        && mtmd_helper_embd_stream_n_tokens_drained(slot.mm_stream)
+           != mtmd_helper_embd_stream_last_chunk_boundary(slot.mm_stream));
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
     const auto checkpoint_pos_min = llama_model_is_openpangu(model) ? pos_max : pos_min;
@@ -3847,6 +3872,9 @@ bool server_context::create_checkpoint(server_slot & slot) {
 }
 
 void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type) {
+    // slots with a live multimodal stream, drained after the token rows are known
+    std::vector<server_slot *> drain_pending;
+
     if (params_base.cont_batching || batch.n_tokens == 0) {
         for (auto& slot : slots) {
             slot.prompt_batch_i0 = -1;
@@ -4043,6 +4071,14 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         if (slot.ga_i > 0) {
                             slot.n_past_se--;
                         }
+                        // Media-final prompts: rewind chunk-atomically so that
+                        // keep_first() and the mm stream never start mid-chunk.
+                        if (mctx && prompt_tokens[slot.n_past_prompt] == LLAMA_TOKEN_NULL) {
+                            while (slot.n_past_prompt > 0 && prompt_tokens[slot.n_past_prompt - 1] == LLAMA_TOKEN_NULL) {
+                                slot.n_past_prompt--;
+                                slot.n_past--;
+                            }
+                        }
                     }
                     apply_checkpoint(slot);
                     slot.n_prompt_tokens_cache = slot.n_past_prompt;
@@ -4067,128 +4103,75 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                 // keep only the common part
                 // remove the non-common part from the cache
-                if (slot.n_past < 0)
-                {
-                    slot.n_past = 0;
-                }
-                slot.cache_tokens.keep_first(slot.n_past);
-                int p0 = (int)system_tokens.size() + slot.n_past;
-                p0 = system_tokens.size() + slot.cache_tokens.pos_next();
-                const bool trimmed = common_speculative_trim_sequence(slot.spec, ctx, slot.id, p0);
-                if (!trimmed) {
-                    // could not partially delete (likely using a non-Transformer model)
-                    common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
-
-                    p0 = (int)system_tokens.size();
-                    if (p0 != 0) {
-                        // copy over the system prompt when there is one
-                        llama_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
-                    }
-
-                    // there is no common part left (except for the system prompt)
-                    slot.cache_tokens.clear();
-                    slot.n_past = 0;
-                    slot.n_past_prompt = 0;
-                    slot.n_past_offset = 0;
-                    slot.n_discarded_prompt = 0;
-                    slot.n_kept_prompt = 0;
-                    slot.n_past_se = 0;
-                    slot.n_prompt_tokens_cache = 0;
-                    slot.ga_i = 0;
-                    slot.server_cached_prompt.checkpoints.clear();
-                    // TODO: is the system prompt ever in the sampling context?
-                    common_sampler_reset(slot.ctx_sampling);
-                }
-
-                LOG_INFO("kv cache rm [p0, end)", {
-                    { "id_slot", slot.id },
-                    { "id_task", slot.id_task },
-                    { "p0",      p0 }
-                    });
-
-                // Coalesced multimodal prefill (drop-in for the per-image side-channel below):
-                // evaluate every remaining prefill position EXCEPT the last one in a single
-                // embd-batch llama_decode. The last text token (guaranteed by chat templates)
-                // falls through to the standard text-token loop, which keeps server::batch
-                // non-empty so the standard post-prefill block + post-decode sampling fire
-                // unchanged.
-                if (mctx != nullptr && slot.n_past_prompt + 1 < slot.n_prompt_tokens) {
-                    size_t consumed = 0;
-                    llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past;
-
-                    server_mtp_warmup mtp_media_warmup {
-                        ctx,
-                        slot.uses_mtp() && slot.spec ? &slot : nullptr,
-                    };
-                    mtmd_helper_eval_batch_callback mtp_media_callback =
-                        mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
-
-                    int32_t res = slot.prompt_tokens.process_chunks_coalesced(
-                            ctx, mctx, slot.n_past_prompt, slot.n_prompt_tokens - 1,
-                            p1, slot.id, consumed,
-                            mtp_media_callback, &mtp_media_warmup);
-                    if (res != 0) {
-                        LLAMA_LOG_ERROR("coalesced prefill failed, res = %d\n", res);
-                        slot.release();
-                        send_error(slot, "coalesced prefill failed", ERROR_TYPE_SERVER);
-                        continue;
-                    }
-
-                    // Mirror consumed tokens/chunks into cache_tokens.
-                    for (size_t k = slot.n_past_prompt; k < slot.n_past_prompt + consumed; ) {
-                        llama_token tok = slot.prompt_tokens[k];
-                        if (tok == LLAMA_TOKEN_NULL) {
-                            slot.prompt_tokens.free_raw_media_data(k);
-                            const auto & chunk = slot.prompt_tokens.find_chunk(k);
-                            slot.cache_tokens.push_back(chunk.get());
-                            k += mtmd_input_chunk_get_n_tokens(chunk.get());
-                        } else {
-                            slot.cache_tokens.push_back(tok);
-                            k++;
-                        }
-                    }
-
-                    slot.n_past                    += consumed;
-                    slot.n_past_prompt             += consumed;
-                    slot.n_prompt_tokens_processed += consumed;
-                }
-
-                // check if we should process the image
-                if (slot.n_past_prompt < slot.n_prompt_tokens
-                    && slot.prompt_tokens[slot.n_past_prompt] == LLAMA_TOKEN_NULL) {
-                    // process the image
-                    size_t n_tokens_out = 0;
-                    llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past; // add offset to prompt
-                    server_mtp_warmup mtp_media_warmup {
-                        ctx,
-                        slot.uses_mtp() && slot.spec ? &slot : nullptr,
-                    };
-                    mtmd_helper_eval_batch_callback mtp_media_callback =
-                        mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
-                    int32_t res = slot.prompt_tokens.process_chunk(
-                            ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out,
-                            mtp_media_callback, &mtp_media_warmup);
-                    if (res != 0) {
-                        LLAMA_LOG_ERROR("failed to process image, res = %d\n", res);
-                        slot.release();
-                        send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
-                        continue;
-                    }
-
-                    // add the image chunk to cache
+                // Skipped while a multimodal stream is live: the KV then holds
+                // drained-but-not-yet-mirrored rows past cache_tokens (for
+                // example a partially decoded image) which this trim would
+                // destroy. The trim ran once, before the stream was created.
+                if (!slot.mm_stream) {
+                    if (slot.n_past < 0)
                     {
-                        slot.prompt_tokens.free_raw_media_data(slot.n_past_prompt);
-                        const auto& chunk = slot.prompt_tokens.find_chunk(slot.n_past_prompt);
-                        slot.cache_tokens.push_back(chunk.get()); // copy
+                        slot.n_past = 0;
+                    }
+                    slot.cache_tokens.keep_first(slot.n_past);
+                    int p0 = (int)system_tokens.size() + slot.n_past;
+                    p0 = system_tokens.size() + slot.cache_tokens.pos_next();
+                    const bool trimmed = common_speculative_trim_sequence(slot.spec, ctx, slot.id, p0);
+                    if (!trimmed) {
+                        // could not partially delete (likely using a non-Transformer model)
+                        common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
+
+                        p0 = (int)system_tokens.size();
+                        if (p0 != 0) {
+                            // copy over the system prompt when there is one
+                            llama_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
+                        }
+
+                        // there is no common part left (except for the system prompt)
+                        slot.cache_tokens.clear();
+                        slot.n_past = 0;
+                        slot.n_past_prompt = 0;
+                        slot.n_past_offset = 0;
+                        slot.n_discarded_prompt = 0;
+                        slot.n_kept_prompt = 0;
+                        slot.n_past_se = 0;
+                        slot.n_prompt_tokens_cache = 0;
+                        slot.ga_i = 0;
+                        slot.server_cached_prompt.checkpoints.clear();
+                        // TODO: is the system prompt ever in the sampling context?
+                        common_sampler_reset(slot.ctx_sampling);
                     }
 
-                    slot.n_past += n_tokens_out;
-                    slot.n_past_prompt += n_tokens_out;
-                    slot.n_prompt_tokens_processed += n_tokens_out;
-                    slot.image_just_processed = true; // do not checkpoint right after an image chunk
+                    LOG_INFO("kv cache rm [p0, end)", {
+                        { "id_slot", slot.id },
+                        { "id_task", slot.id_task },
+                        { "p0",      p0 }
+                        });
                 }
 
-
+                // Multimodal prefill: the slot's whole remaining prompt range
+                // (including a final media chunk) drains from a resumable embd
+                // stream into the server's shared batch - the server owns every
+                // llama_decode. Stream slots are deferred and drained below,
+                // after this round's token rows are known.
+                if (mctx != nullptr && slot.n_past_prompt < slot.n_prompt_tokens
+                        && slot.prompt_tokens.has_media_in_range(slot.n_past_prompt, slot.n_prompt_tokens)) {
+                    if (!slot.mm_stream) {
+                        llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past;
+                        auto mm_chunks = slot.prompt_tokens.build_eval_chunks(
+                                slot.n_past_prompt, slot.n_prompt_tokens);
+                        slot.mm_stream = mtmd_helper_embd_stream_init(
+                                mctx, ctx, mm_chunks.chunks.data(), mm_chunks.chunks.size(), p1, slot.id);
+                        if (!slot.mm_stream) {
+                            LLAMA_LOG_ERROR("failed to create multimodal stream\n");
+                            slot.release();
+                            send_error(slot, "failed to create multimodal stream", ERROR_TYPE_SERVER);
+                            continue;
+                        }
+                        slot.mm_stream_start = slot.n_past_prompt;
+                    }
+                    drain_pending.push_back(&slot);
+                    continue; // stream slots contribute no text-loop rows
+                }
 
                 int32_t slot_npast = slot.n_past_se > 0 ? slot.n_past_se : slot.n_past;
 
@@ -4275,6 +4258,83 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
             }
         }
     }
+
+    // Every round decodes as embd rows: drain multimodal streams into this
+    // round (if any), then convert the token rows staged above (generation +
+    // text prefill) through the input-embedding LUT. Stream rows follow the
+    // token rows; row indices are preserved 1:1, so slot.i_batch /
+    // i_batch_dft / prompt_batch_i0/i1 stay valid.
+    const int32_t n_tok = batch.n_tokens;
+    int32_t row = n_tok;
+    if (!drain_pending.empty() && batch.n_tokens < n_batch) {
+        for (server_slot * slot_ptr : drain_pending) {
+            server_slot & slot = *slot_ptr;
+            if (row >= n_batch) {
+                break;
+            }
+            const int32_t i0 = row;
+            const int32_t n_drained = mtmd_helper_embd_stream_drain(slot.mm_stream, batch_embd.get(), row, n_batch - row);
+            if (n_drained < 0) {
+                LLAMA_LOG_ERROR("multimodal stream drain failed\n");
+                slot.release();
+                send_error(slot, "multimodal stream drain failed", ERROR_TYPE_SERVER);
+                continue;
+            }
+            if (n_drained == 0) {
+                continue; // parked before a non-causal chunk (a solo round follows)
+            }
+            row += n_drained;
+            slot.prompt_batch_i0   = i0;
+            slot.prompt_batch_i1   = row;
+            slot.mm_mirror_pending = true;
+
+            if (mtmd_helper_embd_stream_done(slot.mm_stream)) {
+                // The whole prompt is drained (text-final and media-final prompts
+                // alike): sample from the last drained row.
+                slot.state = SLOT_STATE_PROCESSING;
+                slot.command = SLOT_COMMAND_NONE;
+                GGML_ASSERT((size_t)slot.n_prompt_tokens == slot.prompt_tokens.size());
+                common_sampler_reset(slot.ctx_sampling);
+                for (int i = 0; i < slot.n_prompt_tokens; ++i) {
+                    llama_token id = slot.prompt_tokens[i];
+                    if (id != LLAMA_TOKEN_NULL) {
+                        common_sampler_accept(slot.ctx_sampling, ctx, id, false);
+                    }
+                }
+
+                // extract the logits only for the last token
+                batch_embd->batch.logits[row - 1] = true;
+
+                slot.n_decoded = 0;
+                slot.i_batch = row - 1;
+
+                LOG_VERBOSE("prompt done", {
+                    {"id_slot",  slot.id},
+                    {"n_past",   slot.n_past},
+                    {"n_ctx",    n_ctx},
+                    {"n_tokens", row},
+                    });
+            }
+        }
+
+        if (row > n_tok && batch_type == -1) {
+            batch_type = 0;
+        }
+    }
+
+    if (n_tok > 0) {
+        // convert the token rows staged above through the input-embedding LUT
+        const int32_t res = llama_input_embeddings(ctx, batch.token, n_tok, embd_data.data(),
+                                                   llama_model_n_embd(model));
+        GGML_ASSERT(res == 0);
+        for (int32_t i = 0; i < n_tok; i++) {
+            // textlike pos planes (p,p,p,0) - identical to what libllama
+            // synthesizes for token batches
+            batch_embd->set_pos(MTMD_INPUT_CHUNK_TYPE_TEXT, batch.pos[i], batch.seq_id[i][0], 1, i);
+            batch_embd->batch.logits[i] = batch.logits[i];
+        }
+    }
+    round_n_rows = row;
 }
 
 void server_context::extend_context(const int32_t n_tokens) {
@@ -4714,25 +4774,29 @@ void server_context::update_allowlist_state(server_slot& slot) {
 }
 
 void server_context::process_batch_tokens(int32_t & n_batch) {
-    for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
-        const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+    for (int32_t i = 0; i < round_n_rows; i += n_batch) {
+        const int32_t n_tokens = std::min(n_batch, round_n_rows - i);
         bool finish_prompt_warmup_batch = false;
         extend_context(n_tokens);
 
-        llama_batch batch_view = {
-            n_tokens,
-            batch.token + i,
-            nullptr,
-            batch.pos + i,
-            batch.n_seq_id + i,
-            batch.seq_id + i,
-            batch.logits + i,
-            0, 0, 0, // unused
-        };
+        // rows staged in batch_embd (get_view re-strides the M-RoPE position
+        // planes for the sub-range)
+        llama_batch batch_view = batch_embd->get_view(i, n_tokens);
 
+        // solo non-causal media round (gemma3 family): the whole batch is
+        // image/audio rows of whole chunks; causal attention is restored on
+        // every path out of the decode
+        if (round_non_causal) {
+            llama_set_causal_attn(ctx, false);
+        }
         const int ret = server_decode(ctx, batch_view);
+        if (round_non_causal) {
+            llama_set_causal_attn(ctx, true);
+        }
         if (ret != 0) {
-            if (n_batch == 1 || ret < 0) {
+            // a non-causal round must not be split: halving the batch would
+            // slice a media chunk, breaking intra-ubatch bidirectional attention
+            if (n_batch == 1 || ret < 0 || round_non_causal) {
                 int user_cancel = -3;
                 if (ret == user_cancel) {
                     LLAMA_LOG_INFO("Decode process is cancelled by user.\n");
@@ -4799,6 +4863,42 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             }
         }
     }
+
+        // Mirror multimodal stream rows that this decode made durable into
+        // cache_tokens, chunk-atomically: text rows mirror per token, media
+        // chunks only once fully decoded. A chunk straddling rounds contributes
+        // nothing until the round that completes it.
+        for (auto & slot : slots) {
+            if (!slot.mm_mirror_pending || !slot.mm_stream || i + n_tokens < slot.prompt_batch_i1) {
+                continue;
+            }
+            slot.mm_mirror_pending = false;
+            const size_t boundary = (size_t) slot.mm_stream_start
+                + (size_t) mtmd_helper_embd_stream_last_chunk_boundary(slot.mm_stream);
+            for (size_t k = slot.n_past_prompt; k < boundary; ) {
+                llama_token tok = slot.prompt_tokens[k];
+                if (tok == LLAMA_TOKEN_NULL) {
+                    slot.prompt_tokens.free_raw_media_data(k);
+                    const auto & chunk = slot.prompt_tokens.find_chunk(k);
+                    slot.cache_tokens.push_back(chunk.get());
+                    k += mtmd_input_chunk_get_n_tokens(chunk.get());
+                } else {
+                    slot.cache_tokens.push_back(tok);
+                    k++;
+                }
+            }
+            const int32_t consumed = (int32_t) boundary - slot.n_past_prompt;
+            if (consumed > 0) {
+                slot.n_past                    += consumed;
+                slot.n_past_prompt              = (int32_t) boundary;
+                slot.n_prompt_tokens_processed += consumed;
+                slot.image_just_processed = slot.prompt_tokens[boundary - 1] == LLAMA_TOKEN_NULL;
+            }
+            if (mtmd_helper_embd_stream_done(slot.mm_stream)) {
+                mtmd_helper_embd_stream_free(slot.mm_stream);
+                slot.mm_stream = nullptr;
+            }
+        }
 
         for (auto& slot : slots) {
             bool is_active_slot = (slot.state == SLOT_STATE_PROCESSING);
@@ -4923,6 +5023,58 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
     }
 }
 
+bool server_context::build_non_causal_round(const int32_t n_ubatch) {
+    int32_t row = 0;
+    for (auto & slot : slots) {
+        if (!slot.mm_stream || !mtmd_helper_embd_stream_next_needs_non_causal(slot.mm_stream)) {
+            continue;
+        }
+        // At most one chunk per slot; chunks from DIFFERENT slots may share the
+        // round because the non-causal mask is sequence-aware within the ubatch.
+        if (row + mtmd_helper_embd_stream_next_n_tokens(slot.mm_stream) > n_ubatch) {
+            continue;
+        }
+        const int32_t i0 = row;
+        const int32_t n_drained = mtmd_helper_embd_stream_drain(slot.mm_stream, batch_embd.get(), row, n_ubatch - row);
+        if (n_drained < 0) {
+            LLAMA_LOG_ERROR("multimodal stream drain failed\n");
+            slot.release();
+            send_error(slot, "multimodal stream drain failed", ERROR_TYPE_SERVER);
+            continue;
+        }
+        if (n_drained == 0) {
+            continue;
+        }
+        row += n_drained;
+        slot.prompt_batch_i0   = i0;
+        slot.prompt_batch_i1   = row;
+        slot.mm_mirror_pending = true;
+
+        if (mtmd_helper_embd_stream_done(slot.mm_stream)) {
+            // the prompt ends with this media chunk: sample from its last row
+            slot.state = SLOT_STATE_PROCESSING;
+            slot.command = SLOT_COMMAND_NONE;
+            GGML_ASSERT((size_t)slot.n_prompt_tokens == slot.prompt_tokens.size());
+            common_sampler_reset(slot.ctx_sampling);
+            for (int i = 0; i < slot.n_prompt_tokens; ++i) {
+                llama_token id = slot.prompt_tokens[i];
+                if (id != LLAMA_TOKEN_NULL) {
+                    common_sampler_accept(slot.ctx_sampling, ctx, id, false);
+                }
+            }
+            batch_embd->batch.logits[row - 1] = true;
+            slot.n_decoded = 0;
+            slot.i_batch = row - 1;
+        }
+    }
+    if (row == 0) {
+        return false;
+    }
+    round_non_causal = true;
+    round_n_rows     = row;
+    return true;
+}
+
 void server_context::update_slots() {
     if (system_need_update) {
         system_prompt_update();
@@ -4950,14 +5102,13 @@ void server_context::update_slots() {
 
     // start populating the batch for this iteration
     common_batch_clear(batch);
+    round_non_causal = false;
+    round_n_rows     = 0;
 
     for (auto & slot : slots) {
         slot.prompt_batch_i0 = -1;
         slot.prompt_batch_i1 = -1;
     }
-
-    // first, add sampled tokens from any ongoing sequences
-    add_sampled_tokens(); // Prepare batch for inference
 
     // process in chunks of params.n_batch
     int32_t n_batch = llama_n_batch(ctx);
@@ -4966,18 +5117,30 @@ void server_context::update_slots() {
     // track if this is an embedding or non-embedding batch
     // if we've added sampled tokens above, we are in non-embedding mode
     // -1: none, 0: non-embedding, 1: embedding
-    int32_t batch_type = batch.n_tokens > 0 ? 0 : -1;
+    int32_t batch_type = -1;
 
-    // next, batch any pending prompts without exceeding n_batch
-    batch_pending_prompt(n_ubatch, n_batch, batch_type); // Prepare batch for prompt process
+    if (mctx && mtmd_decode_use_non_causal(mctx) && build_non_causal_round(n_ubatch)) {
+        // solo media round (gemma3 family). Generation rows wait exactly one
+        // round: slot.sampled is only consumed by add_sampled_tokens, i_batch
+        // stays -1, and the next normal round picks them up.
+        batch_type = 0;
+    } else {
+        // first, add sampled tokens from any ongoing sequences
+        add_sampled_tokens(); // Prepare batch for inference
 
-    if (batch.n_tokens == 0) {
+        batch_type = batch.n_tokens > 0 ? 0 : -1;
+
+        // next, batch any pending prompts without exceeding n_batch
+        batch_pending_prompt(n_ubatch, n_batch, batch_type); // Prepare batch for prompt process
+    }
+
+    if (round_n_rows == 0) {
         LOG_VERBOSE("no tokens to decode", {});
         return;
     }
 
     LOG_VERBOSE("decoding batch", {
-        {"n_tokens", batch.n_tokens},
+        {"n_tokens", round_n_rows},
         });
 
     // make sure we're in the right embedding mode

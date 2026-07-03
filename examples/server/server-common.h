@@ -467,33 +467,20 @@ public:
     // make sure all text tokens are within the vocab range
     bool validate(const struct llama_context* ctx) const;
 
-    // encode and decode the image chunk
-    int32_t process_chunk(
-        llama_context* ctx,
-        mtmd_context* mctx,
-        size_t idx,
-        llama_pos pos,
-        int32_t seq_id,
-        size_t& n_tokens_out,
-        mtmd_helper_eval_batch_callback callback = nullptr,
-        void * callback_user_data = nullptr) const;
+    // true if the token range [start_token_idx, end_token_idx) contains any media chunk
+    bool has_media_in_range(size_t start_token_idx, size_t end_token_idx) const;
 
-    // Coalesced prefill: evaluates the token range [start_token_idx, end_token_idx) as
-    // ONE embd batch (text rows via the input-embedding LUT, image/audio rows via
-    // mtmd_encode). Side-channel llama_decode call, mirroring the existing per-image
-    // pattern but with a bigger payload.
-    // Returns 0 on success; n_tokens_out is the slot count consumed (caller advances
-    // slot.n_past / slot.n_past_prompt by this amount).
-    int32_t process_chunks_coalesced(
-        llama_context* ctx,
-        mtmd_context* mctx,
-        size_t start_token_idx,
-        size_t end_token_idx,
-        llama_pos pos,
-        int32_t seq_id,
-        size_t& n_tokens_out,
-        mtmd_helper_eval_batch_callback callback = nullptr,
-        void * callback_user_data = nullptr) const;
+    // Chunk-pointer view of [start_token_idx, end_token_idx) for
+    // mtmd_helper_embd_stream_init(). Consecutive text positions collapse into
+    // one temporary text chunk (owned by text_owner; the stream copies text at
+    // init, so the view may be destroyed as soon as init returns). Media
+    // pointers borrow from map_idx_to_media and are valid while this
+    // server_tokens instance is alive and unmodified.
+    struct chunk_view {
+        std::vector<mtmd::input_chunk_ptr>    text_owner;
+        std::vector<const mtmd_input_chunk *> chunks;
+    };
+    chunk_view build_eval_chunks(size_t start_token_idx, size_t end_token_idx) const;
 
     server_tokens clone() const;
 
