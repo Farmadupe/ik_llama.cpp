@@ -774,51 +774,13 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
     return tokenizer.tokenize(output);
 }
 
-int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
-    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-        LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
-        return 0;
-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-        if (!ctx->ctx_v) {
-            LOG_ERR("%s: model does not support vision input\n", __func__);
-            return 1;
-        }
-        // If in the future, we somehow accidentally try to reencode an already-encoded chunk,
-        // chunk->tokens_image will have been cleared out to save memory
-        GGML_ASSERT(!chunk->tokens_image->batch_f32.entries.empty()
-            && "mtmd_encode_chunk: image data already released (double encode?)");
-        return mtmd_encode(ctx, chunk->tokens_image.get());
-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-        if (!ctx->ctx_a) {
-            LOG_ERR("%s: model does not support audio input\n", __func__);
-            return 1;
-        }
-        // If in the future, we somehow accidentally try to reencode an already-encoded chunk,
-        // chunk->tokens_audio will have been cleared out to save memory
-        GGML_ASSERT(!chunk->tokens_audio->batch_f32.entries.empty()
-            && "mtmd_encode_chunk: audio data already released (double encode?)");
-        int n_mmproj_embd = ctx->n_embd_text;
-        ctx->image_embd_v.resize(chunk->tokens_audio->n_tokens * n_mmproj_embd);
-        bool ok = clip_image_batch_encode(
-            ctx->ctx_a,
-            ctx->n_threads,
-            &chunk->tokens_audio->batch_f32,
-            ctx->image_embd_v.data());
-        return ok ? 0 : 1;
-    }
-
-    LOG_ERR("%s: unknown chunk type %d\n", __func__, (int)chunk->type);
-    return 1;
-}
-
-int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
+static int32_t mtmd_encode_image_into(mtmd_context * ctx, const mtmd_image_tokens * image_tokens, float * out) {
     clip_ctx * ctx_clip = ctx->ctx_v;
     if (!ctx_clip) {
         LOG_ERR("%s: this API does not support non-vision input, please use mtmd_encode_chunk instead\n", __func__);
         return 1;
     }
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
-    ctx->image_embd_v.resize(image_tokens->n_tokens() * n_mmproj_embd);
     bool ok = false;
 
     if (clip_is_llava(ctx_clip)
@@ -832,17 +794,70 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
                 ctx_clip,
                 ctx->n_threads,
                 entries[i].get(),
-                ctx->image_embd_v.data() + i*n_mmproj_embd*n_tokens_per_image);
+                out + i*n_mmproj_embd*n_tokens_per_image);
         }
     } else {
         ok = clip_image_batch_encode(
             ctx_clip,
             ctx->n_threads,
             &image_tokens->batch_f32,
-            ctx->image_embd_v.data());
+            out);
     }
 
     return ok ? 0 : 1;
+}
+
+int32_t mtmd_encode_chunk_into(mtmd_context * ctx, const mtmd_input_chunk * chunk, float * out) {
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+        LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
+        return 0;
+    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        if (!ctx->ctx_v) {
+            LOG_ERR("%s: model does not support vision input\n", __func__);
+            return 1;
+        }
+        // If in the future, we somehow accidentally try to reencode an already-encoded chunk,
+        // chunk->tokens_image will have been cleared out to save memory
+        GGML_ASSERT(!chunk->tokens_image->batch_f32.entries.empty()
+            && "mtmd_encode_chunk: image data already released (double encode?)");
+        return mtmd_encode_image_into(ctx, chunk->tokens_image.get(), out);
+    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        if (!ctx->ctx_a) {
+            LOG_ERR("%s: model does not support audio input\n", __func__);
+            return 1;
+        }
+        // If in the future, we somehow accidentally try to reencode an already-encoded chunk,
+        // chunk->tokens_audio will have been cleared out to save memory
+        GGML_ASSERT(!chunk->tokens_audio->batch_f32.entries.empty()
+            && "mtmd_encode_chunk: audio data already released (double encode?)");
+        bool ok = clip_image_batch_encode(
+            ctx->ctx_a,
+            ctx->n_threads,
+            &chunk->tokens_audio->batch_f32,
+            out);
+        return ok ? 0 : 1;
+    }
+
+    LOG_ERR("%s: unknown chunk type %d\n", __func__, (int)chunk->type);
+    return 1;
+}
+
+int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+    if (chunk->type != MTMD_INPUT_CHUNK_TYPE_TEXT) {
+        size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        ctx->image_embd_v.resize(n_tokens * (size_t) ctx->n_embd_text);
+    }
+    return mtmd_encode_chunk_into(ctx, chunk, ctx->image_embd_v.data());
+}
+
+int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
+    clip_ctx * ctx_clip = ctx->ctx_v;
+    if (!ctx_clip) {
+        LOG_ERR("%s: this API does not support non-vision input, please use mtmd_encode_chunk instead\n", __func__);
+        return 1;
+    }
+    ctx->image_embd_v.resize(image_tokens->n_tokens() * clip_n_mmproj_embd(ctx_clip));
+    return mtmd_encode_image_into(ctx, image_tokens, ctx->image_embd_v.data());
 }
 
 float * mtmd_get_output_embd(mtmd_context * ctx) {

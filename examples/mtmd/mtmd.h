@@ -216,6 +216,15 @@ MTMD_API int32_t mtmd_encode(mtmd_context * ctx,
 MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
                                    const mtmd_input_chunk * chunk);
 
+// same as mtmd_encode_chunk(), but writes the encoded rows into a
+// caller-provided buffer instead of the context-owned scratch returned by
+// mtmd_get_output_embd(). out must have room for at least:
+//   llama_model_n_embd(model) * mtmd_input_chunk_get_n_tokens(chunk) floats
+// returns 0 on success
+MTMD_API int32_t mtmd_encode_chunk_into(mtmd_context * ctx,
+                                        const mtmd_input_chunk * chunk,
+                                        float * out);
+
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
