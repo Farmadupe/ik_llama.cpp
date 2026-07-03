@@ -60,17 +60,6 @@ llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks * chunks) {
 
 // helper struct to make working with embd batch easier
 // note: this will be removed after llama_batch_ext refactoring
-// One contiguous run of either text or image rows inside a coalesced embedding buffer.
-// Used by decode_embd_batch::set_position_mixed to assign positions for batches that
-// interleave text tokens and image patches from multiple chunks.
-struct chunk_segment {
-    enum source_type { TEXT, IMAGE };
-    source_type type;
-    int32_t offset;    // start row in the embd buffer
-    int32_t n_tokens;  // rows occupied
-    int32_t nx, ny;    // IMAGE-only: ViT-output grid dimensions (n_tokens == nx*ny)
-};
-
 struct decode_embd_batch {
     int n_pos_per_embd;
     int n_mmproj_embd;
@@ -99,101 +88,55 @@ struct decode_embd_batch {
         };
     }
 
-    void set_position_normal(llama_pos pos_0, llama_seq_id seq_id) {
-        seq_id_0[0] = seq_id;
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.pos     [i] = pos_0 + i;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-    }
-
-    // M-RoPE for image
-    void set_position_mrope_2d(llama_pos pos_0, int nx, int ny, llama_seq_id seq_id) {
-        GGML_ASSERT(n_pos_per_embd == 4);
-        seq_id_0[0] = seq_id;
-        for (int y = 0; y < ny; y++) {
-            for (int x = 0; x < nx; x++) {
-                int i = y * nx + x;
+    // Assign rope indexes.
+    void set_pos(
+        mtmd_input_chunk_type chunk_type,
+        //Temporal index of first token
+        llama_pos pos_0,
+        llama_seq_id seq_id,
+        int n_tokens,
+        ///////////////////
+        //batch offsets
+        ///////////////////
+        //Offset into batch
+        int offset = 0,
+        // Image dims and offset into image
+        int nx = 0,
+        int ny = 0,
+        int image_offset = 0
+    ) {
+        if (n_pos_per_embd == 1) {
+            // normal
+            for (int i = 0; i < n_tokens; i++) {
+                batch.pos[offset + i] = pos_0 + i;
+            }
+        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            // M-RoPE for image
+            GGML_ASSERT(image_offset + n_tokens <= nx * ny);
+            for (int k = 0; k < n_tokens; k++) {
+                int y = (image_offset + k) / nx;
+                int x = (image_offset + k) % nx;
+                int i = offset + k;
                 pos[i                     ] = pos_0;
                 pos[i + batch.n_tokens    ] = pos_0 + y;
                 pos[i + batch.n_tokens * 2] = pos_0 + x;
                 pos[i + batch.n_tokens * 3] = 0; // last pos dim is unused
             }
-        }
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-    }
-
-    // M-RoPE for audio
-    void set_position_mrope_1d(llama_pos pos_0, llama_seq_id seq_id) {
-        GGML_ASSERT(n_pos_per_embd == 4);
-        seq_id_0[0] = seq_id;
-        for (int i = 0; i < batch.n_tokens; i++) {
-            pos[i                     ] = pos_0 + i;
-            pos[i + batch.n_tokens    ] = pos_0 + i;
-            pos[i + batch.n_tokens * 2] = pos_0 + i;
-            pos[i + batch.n_tokens * 3] = 0; // last pos dim is unused
-        }
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-    }
-
-    // Coalesced batch mixing text tokens and image patches from multiple chunks.
-    // For non-M-RoPE (n_pos_per_embd == 1): sequential positions from pos_0.
-    // For M-RoPE (n_pos_per_embd == 4): each text token advances the temporal counter by 1
-    // and writes (t,t,t); each whole image advances the temporal counter by 1 (regardless of
-    // patch count) and emits per-patch (t, t+y, t+x). Matches the convention used by the
-    // per-chunk code path, so output equivalence holds.
-    void set_position_mixed(llama_pos pos_0,
-                            const std::vector<chunk_segment> & segments,
-                            llama_seq_id seq_id) {
-        seq_id_0[0] = seq_id;
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-
-        if (n_pos_per_embd == 1) {
-            for (int i = 0; i < batch.n_tokens; i++) {
-                batch.pos[i] = pos_0 + i;
+        } else {
+            // M-RoPE for text/audio
+            for (int i = 0; i < n_tokens; i++) {
+                int j = offset + i;
+                pos[j                     ] = pos_0 + i;
+                pos[j + batch.n_tokens    ] = pos_0 + i;
+                pos[j + batch.n_tokens * 2] = pos_0 + i;
+                pos[j + batch.n_tokens * 3] = 0; // last pos dim is unused
             }
-            return;
         }
-
-        GGML_ASSERT(n_pos_per_embd == 4);
-        llama_pos t = pos_0;
-        for (const auto & seg : segments) {
-            if (seg.type == chunk_segment::TEXT) {
-                for (int32_t i = 0; i < seg.n_tokens; i++) {
-                    const int idx = seg.offset + i;
-                    pos[idx                     ] = t + i;
-                    pos[idx + batch.n_tokens    ] = t + i;
-                    pos[idx + batch.n_tokens * 2] = t + i;
-                    pos[idx + batch.n_tokens * 3] = 0;
-                }
-                t += seg.n_tokens;
-            } else {
-                // IMAGE: all patches share temporal `t`; height/width vary across the grid.
-                for (int y = 0; y < seg.ny; y++) {
-                    for (int x = 0; x < seg.nx; x++) {
-                        const int idx = seg.offset + y * seg.nx + x;
-                        pos[idx                     ] = t;
-                        pos[idx + batch.n_tokens    ] = t + y;
-                        pos[idx + batch.n_tokens * 2] = t + x;
-                        pos[idx + batch.n_tokens * 3] = 0;
-                    }
-                }
-                t += 1; // whole image is one temporal tick
-            }
+        seq_id_0[0] = seq_id;
+        for (int i = 0; i < n_tokens; i++) {
+            batch.n_seq_id[offset + i] = 1;
+            batch.seq_id  [offset + i] = seq_id_0.data();
+            batch.logits  [offset + i] = false;
         }
     }
 
@@ -258,24 +201,18 @@ static int32_t mtmd_helper_decode_image_chunk_impl(
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
-    if (mtmd_decode_use_mrope(ctx)) {
-        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-            const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
-            if (!image_tokens) {
-                LOG_ERR("failed to decode chunk: image tokens are null\n");
-                return -1;
-            }
-            const int nx = mtmd_image_tokens_get_nx(image_tokens);
-            const int ny = mtmd_image_tokens_get_ny(image_tokens);
-            batch_embd.set_position_mrope_2d(n_past, nx, ny, seq_id);
-        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-            batch_embd.set_position_mrope_1d(n_past, seq_id);
-        } else {
-            GGML_ABORT("invalid chunk type for M-RoPE");
+    int nx = 0;
+    int ny = 0;
+    if (mtmd_decode_use_mrope(ctx) && chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+        if (!image_tokens) {
+            LOG_ERR("failed to decode chunk: image tokens are null\n");
+            return -1;
         }
-    } else {
-        batch_embd.set_position_normal(n_past, seq_id);
+        nx = mtmd_image_tokens_get_nx(image_tokens);
+        ny = mtmd_image_tokens_get_ny(image_tokens);
     }
+    batch_embd.set_pos(chunk_type, n_past, seq_id, n_tokens, 0, nx, ny);
 
     if (mtmd_decode_use_non_causal(ctx)) {
         llama_set_causal_attn(lctx, false);
@@ -431,8 +368,8 @@ int32_t mtmd_helper_eval_chunk_single_with_callback(mtmd_context * ctx,
 
 int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
                                    struct llama_context * lctx,
-                                   const struct mtmd_helper_coalesce_input * inputs,
-                                   size_t n_inputs,
+                                   const struct mtmd_helper_coalesce_input * chunks,
+                                   size_t n_chunks,
                                    llama_pos n_past,
                                    llama_seq_id seq_id,
                                    int32_t n_batch,
@@ -448,22 +385,23 @@ int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
     const int           n_mmproj_embd  = llama_model_n_embd(model);
     const int           n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
 
-    if (n_inputs == 0) {
+    if (n_chunks == 0) {
         *new_n_past = n_past;
         return 0;
     }
 
-    // First pass: count totals so we know how big the embd buffer needs to be.
+    // First pass: count totals for position accounting and progress reporting.
+    // This pass reifies nothing.
     int32_t   n_total_tokens = 0;
     llama_pos n_pos_advance  = 0;
-    for (size_t i = 0; i < n_inputs; i++) {
-        const auto & in = inputs[i];
-        if (in.is_text) {
-            n_total_tokens += in.n_text_tokens;
-            n_pos_advance  += in.n_text_tokens;
+    for (size_t i = 0; i < n_chunks; i++) {
+        const auto & chunk = chunks[i];
+        if (chunk.is_text) {
+            n_total_tokens += chunk.n_text_tokens;
+            n_pos_advance  += chunk.n_text_tokens;
         } else {
-            n_total_tokens += (int32_t) mtmd_input_chunk_get_n_tokens(in.chunk);
-            n_pos_advance  += mtmd_input_chunk_get_n_pos(in.chunk);
+            n_total_tokens += (int32_t) mtmd_input_chunk_get_n_tokens(chunk.chunk);
+            n_pos_advance  += mtmd_input_chunk_get_n_pos(chunk.chunk);
         }
     }
 
@@ -472,71 +410,27 @@ int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
         return 0;
     }
 
-    // Second pass: fill the buffer and build position segments.
-    std::vector<float>         buffer((size_t) n_total_tokens * n_mmproj_embd);
-    std::vector<chunk_segment> segments;
-    segments.reserve(n_inputs);
-
-    int32_t offset = 0;
-    for (size_t i = 0; i < n_inputs; i++) {
-        const auto & in = inputs[i];
-
-        if (in.is_text) {
-            int32_t ret = llama_input_embeddings(lctx, in.text_tokens, in.n_text_tokens,
-                                                 buffer.data() + (size_t) offset * n_mmproj_embd,
-                                                 n_mmproj_embd);
-            if (ret != 0) {
-                LOG_ERR("%s: llama_input_embeddings failed on text input %zu\n", __func__, i);
-                return ret;
-            }
-            segments.push_back({chunk_segment::TEXT, offset, in.n_text_tokens, 0, 0});
-            offset += in.n_text_tokens;
-        } else {
-            const auto      type     = mtmd_input_chunk_get_type(in.chunk);
-            const int32_t   n_tokens = (int32_t) mtmd_input_chunk_get_n_tokens(in.chunk);
-
-            int32_t ret = mtmd_encode_chunk(ctx, in.chunk);
-            if (ret != 0) {
-                LOG_ERR("%s: mtmd_encode_chunk failed on media input %zu\n", __func__, i);
-                return ret;
-            }
-            float * encoded = mtmd_get_output_embd(ctx);
-            std::memcpy(buffer.data() + (size_t) offset * n_mmproj_embd, encoded,
-                        (size_t) n_tokens * n_mmproj_embd * sizeof(float));
-
-            if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-                const auto * image_tokens = mtmd_input_chunk_get_tokens_image(in.chunk);
-                const int    nx           = mtmd_image_tokens_get_nx(image_tokens);
-                const int    ny           = mtmd_image_tokens_get_ny(image_tokens);
-                segments.push_back({chunk_segment::IMAGE, offset, n_tokens, nx, ny});
-            } else if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-                // Audio positions are text-like under M-RoPE (each audio token = 1 temporal tick).
-                segments.push_back({chunk_segment::TEXT, offset, n_tokens, 0, 0});
-            } else {
-                GGML_ABORT("media input must be IMAGE or AUDIO");
-            }
-            offset += n_tokens;
-        }
-    }
-
-    // Build the coalesced embd batch and assign positions.
-    decode_embd_batch batch_embd(buffer.data(), n_total_tokens, n_pos_per_embd, n_mmproj_embd);
-    batch_embd.set_position_mixed(n_past, segments, seq_id);
-
-    if (logits_last) {
-        batch_embd.batch.logits[n_total_tokens - 1] = true;
-    }
-
-    // Submit in slices of up to n_batch; llama_decode further splits internally by n_ubatch.
+    // Not compatible with gemma3/gemma4
+    n_batch = std::min(n_batch, n_total_tokens);
     const int32_t n_calls = (n_total_tokens + n_batch - 1) / n_batch;
-    for (int32_t i_batch = 0; i_batch < n_calls; i_batch++) {
-        const int pos_offset    = i_batch * n_batch;
-        const int n_tokens_view = std::min(n_batch, n_total_tokens - pos_offset);
-        llama_batch view        = batch_embd.get_view(pos_offset, n_tokens_view);
+
+    std::vector<float> embd((size_t) n_batch * n_mmproj_embd);
+    decode_embd_batch  batch_embd(embd.data(), n_batch, n_pos_per_embd, n_mmproj_embd);
+
+    int32_t   n_filled    = 0;      // rows currently in embd, not yet decoded
+    int32_t   i_flush     = 0;
+    llama_pos t           = n_past; // position counter, see below
+
+    auto flush = [&]() -> int32_t {
+        if (n_filled == 0) {
+            return 0;
+        }
+        llama_batch view = batch_embd.get_view(0, n_filled);
 
         int32_t ret = llama_decode(lctx, view);
+        i_flush++;
         if (ret != 0) {
-            LOG_ERR("%s: llama_decode failed on coalesced batch %d/%d\n", __func__, i_batch + 1, n_calls);
+            LOG_ERR("%s: llama_decode failed on coalesced batch %d/%d\n", __func__, i_flush, n_calls);
             return ret;
         }
 
@@ -546,6 +440,96 @@ int32_t mtmd_helper_eval_coalesced(mtmd_context * ctx,
                 LOG_ERR("%s: callback failed\n", __func__);
                 return cb_ret;
             }
+        }
+
+        n_filled = 0;
+        return 0;
+    };
+
+    for (size_t i = 0; i < n_chunks; i++) {
+        const auto & in = chunks[i];
+
+        if (in.is_text) {
+            // A run may straddle batch boundaries; look up each sub-span directly
+            // into embd at the fill offset.
+            int32_t done = 0;
+            while (done < in.n_text_tokens) {
+                if (n_filled == n_batch) {
+                    int32_t ret = flush();
+                    if (ret != 0) {
+                        return ret;
+                    }
+                }
+                const int32_t take = std::min(n_batch - n_filled, in.n_text_tokens - done);
+                int32_t ret = llama_input_embeddings(lctx, in.text_tokens + done, take,
+                                                     embd.data() + (size_t) n_filled * n_mmproj_embd,
+                                                     n_mmproj_embd);
+                if (ret != 0) {
+                    LOG_ERR("%s: llama_input_embeddings failed on text input %zu\n", __func__, i);
+                    return ret;
+                }
+                batch_embd.set_pos(MTMD_INPUT_CHUNK_TYPE_TEXT, t + done, seq_id, take, n_filled);
+                n_filled += take;
+                done     += take;
+            }
+            t += in.n_text_tokens;
+        } else {
+            const auto    type     = mtmd_input_chunk_get_type(in.chunk);
+            const int32_t n_tokens = (int32_t) mtmd_input_chunk_get_n_tokens(in.chunk);
+
+            if (type != MTMD_INPUT_CHUNK_TYPE_IMAGE && type != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+                GGML_ABORT("media input must be IMAGE or AUDIO");
+            }
+            // Audio positions are text-like under M-RoPE (each token = 1 temporal tick).
+            const bool image_mrope = type == MTMD_INPUT_CHUNK_TYPE_IMAGE && n_pos_per_embd == 4;
+            int32_t nx = 0;
+            int32_t ny = 0;
+            if (image_mrope) {
+                const auto * image_tokens = mtmd_input_chunk_get_tokens_image(in.chunk);
+                nx = mtmd_image_tokens_get_nx(image_tokens);
+                ny = mtmd_image_tokens_get_ny(image_tokens);
+            }
+
+            int32_t ret = mtmd_encode_chunk(ctx, in.chunk);
+            if (ret != 0) {
+                LOG_ERR("%s: mtmd_encode_chunk failed on media input %zu\n", __func__, i);
+                return ret;
+            }
+            // Valid until the next mtmd_encode_chunk, which is after this chunk has
+            // been fully drained into one or more batches below.
+            const float * encoded = mtmd_get_output_embd(ctx);
+
+            int32_t done = 0;
+            while (done < n_tokens) {
+                if (n_filled == n_batch) {
+                    int32_t fret = flush();
+                    if (fret != 0) {
+                        return fret;
+                    }
+                }
+                const int32_t take = std::min(n_batch - n_filled, n_tokens - done);
+                std::memcpy(embd.data() + (size_t) n_filled * n_mmproj_embd,
+                            encoded + (size_t) done * n_mmproj_embd,
+                            (size_t) take * n_mmproj_embd * sizeof(float));
+                if (image_mrope) {
+                    batch_embd.set_pos(type, t, seq_id, take, n_filled, nx, ny, done);
+                } else {
+                    batch_embd.set_pos(type, t + done, seq_id, take, n_filled);
+                }
+                n_filled += take;
+                done     += take;
+            }
+            t += image_mrope ? 1 : n_tokens;
+        }
+    }
+
+    if (logits_last && n_filled > 0) {
+        batch_embd.batch.logits[n_filled - 1] = true;
+    }
+    {
+        int32_t ret = flush();
+        if (ret != 0) {
+            return ret;
         }
     }
 
