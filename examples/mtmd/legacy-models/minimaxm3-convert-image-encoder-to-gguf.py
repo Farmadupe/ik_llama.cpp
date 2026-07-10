@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 import torch
-from gguf import GGUFEndian, GGUFWriter
+from gguf import GGMLQuantizationType, GGUFEndian, GGUFWriter
 from safetensors.torch import load_file
 
 
@@ -71,8 +71,11 @@ def main() -> None:
     parser.add_argument("-m", "--model-dir", required=True, help="Path to MiniMax-M3 HF model directory")
     parser.add_argument("-o", "--output", default=None, help="Output GGUF path")
     parser.add_argument("--use-f32", action="store_true", help="Write tensors as f32 instead of f16")
+    parser.add_argument("--use-bf16", action="store_true", help="Write tensors as bf16 instead of f16")
     parser.add_argument("--bigendian", action="store_true", help="Write big-endian GGUF")
     args = parser.parse_args()
+    if args.use_f32 and args.use_bf16:
+        parser.error("--use-f32 and --use-bf16 are mutually exclusive")
 
     model_dir = Path(args.model_dir)
     config = read_json(model_dir / "config.json")
@@ -133,18 +136,34 @@ def main() -> None:
                 patch_name = dst_name if i == 0 else f"{dst_name}.{i}"
                 patch_data = data[:, :, i]
                 if args.use_f32:
-                    patch_data = patch_data.float()
+                    writer.add_tensor(patch_name, patch_data.float().numpy())
+                elif args.use_bf16:
+                    if patch_data.dtype == torch.bfloat16:
+                        writer.add_tensor(
+                            patch_name,
+                            patch_data.contiguous().view(torch.int16).numpy(),
+                            raw_dtype=GGMLQuantizationType.BF16,
+                        )
+                    else:
+                        writer.add_tensor(patch_name, patch_data.float().numpy())
                 else:
-                    patch_data = patch_data.half()
-                writer.add_tensor(patch_name, patch_data.numpy())
+                    writer.add_tensor(patch_name, patch_data.half().numpy())
             continue
         if args.use_f32:
-            data = data.float()
+            writer.add_tensor(dst_name, data.float().numpy())
+        elif args.use_bf16 and data.ndim > 1:
+            if data.dtype == torch.bfloat16:
+                writer.add_tensor(
+                    dst_name,
+                    data.contiguous().view(torch.int16).numpy(),
+                    raw_dtype=GGMLQuantizationType.BF16,
+                )
+            else:
+                writer.add_tensor(dst_name, data.float().numpy())
         elif data.ndim == 2 and dst_name.endswith(".weight"):
-            data = data.half()
+            writer.add_tensor(dst_name, data.half().numpy())
         else:
-            data = data.float()
-        writer.add_tensor(dst_name, data.numpy())
+            writer.add_tensor(dst_name, data.float().numpy())
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()

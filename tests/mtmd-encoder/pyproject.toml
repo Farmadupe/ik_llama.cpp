@@ -1,0 +1,15 @@
+[project]
+name = "mtmd-encoder-parity"
+version = "0.0.0"
+description = "Common orchestrator for the mtmd vision-encoder parity harnesses"
+requires-python = ">=3.12,<3.13"
+# numpy + pillow only.
+dependencies = [
+    "numpy",
+    "pillow",
+]
+
+# This project is just the runner + shared modules; there is nothing to build or
+# install, so uv manages only the dependency environment.
+[tool.uv]
+package = false

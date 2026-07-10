@@ -1,0 +1,21 @@
+[project]
+name = "step3vl-vision-parity"
+version = "0.0.0"
+description = "Parity test: ik_llama.cpp step3vl vision tower vs the day-1 HF reference encoder"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch",
+    "torchvision",  # Step3's image processor resizes with torchvision (antialiased bicubic/bilinear)
+    "transformers",
+    "safetensors",
+    "numpy",
+    "pillow",
+    # repo-local gguf-py, so the generated mmproj is byte-compatible with ik's clip loader
+    "gguf",
+]
+
+# Default PyPI torch wheels bundle the CUDA runtime on Linux; ref_encode.py
+# runs the reference on GPU (fp32, TF32 disabled) and REF_DEVICE=cpu still
+# forces the CPU path with the same install.
+[tool.uv.sources]
+gguf = { path = "../../../gguf-py", editable = true }
