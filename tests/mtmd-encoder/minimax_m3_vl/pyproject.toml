@@ -1,0 +1,27 @@
+[project]
+name = "minimax_m3_vl-vision-parity"
+version = "0.0.0"
+description = "Parity test: ik_llama.cpp minimax_m3_vl vision tower vs the HF reference encoder"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch",
+    "torchvision",  # MiniMax's image processor is a torchvision-backed fast processor
+    "transformers",
+    "safetensors",
+    "numpy",
+    "pillow",
+    # repo-local gguf-py, so the generated mmproj is byte-compatible with ik's clip loader
+    "gguf",
+]
+
+# CPU-only torch: the reference runs one small image, so we avoid CUDA-version
+# matching entirely and keep the download lean.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+gguf = { path = "../../../gguf-py", editable = true }

@@ -4,3 +4,26 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+
+# mtmd-encoder test scaffolding. The blanket "*" above ignores whole
+# subtrees whose directory names have no ".", and files under an excluded
+# directory can never be re-included by "!*.*". So re-include the directory
+# tree first (letting "!*.*" pick up the dotted source files), then re-ignore
+# generated artifacts and heavy/build outputs. Consolidated here (rather than
+# the repo-root .gitignore) because this deeper file wins for paths under
+# tests/, so the root rules were dead.
+!mtmd-encoder/
+!mtmd-encoder/**/
+mtmd-encoder/**/*.gguf
+mtmd-encoder/**/build/
+mtmd-encoder/**/.venv/
+mtmd-encoder/**/__pycache__/
+mtmd-encoder/**/.pytest_cache/
+mtmd-encoder/**/uv.lock
+mtmd-encoder/*/images/
+mtmd-encoder/*/reference/
+mtmd-encoder/*/metrics.json
+mtmd-encoder/*/*_embeddings.json
+mtmd-encoder/*/*_layout.json
+mtmd-encoder/*/parity_results.md
+mtmd-encoder/*/*.pyc

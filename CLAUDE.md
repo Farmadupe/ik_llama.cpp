@@ -12,6 +12,9 @@
   (`def f() -> str:`), Rust/C++ returns and member access, shell/Make rules, etc.
   The rule targets arrows used as prose shorthand, not code tokens.
 
+- **Do not use `@property`.** Prefer a plain method with explicit call syntax
+  (e.g. `obj.shape()` over `obj.shape`).
+
 - **Build with CUDA for testing.** Use `./farmadupe/scripts/compile.sh`
   when building for the python test suites in `farmadupe/test/`; the machine
   has an RTX 3090 and qwen3vl-4b-q4 fits comfortably. Drop back to a CPU build

@@ -1,0 +1,49 @@
+[project]
+name = "kimik25-vision-parity"
+version = "0.0.0"
+description = "Parity test: ik_llama.cpp kimik25 vision tower vs the HF reference encoder"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch",
+    "transformers>=5.13",  # dynamic-module loader for the checkpoint's own (remote) code
+    "safetensors",
+    "numpy",
+    "pillow",
+    "pydantic",  # required by the checkpoint's media_utils.py
+    # repo-local gguf-py, so the generated mmproj is byte-compatible with ik's clip loader
+    "gguf",
+    # production attention path: bf16 + flash_attention_2 (the checkpoint default).
+    # No prebuilt wheel exists for the pinned torch, so uv builds it from source
+    # (see [tool.uv] below and the build env in run_all.py's uv sync step).
+    "flash-attn==2.8.3.post1",
+    # flash-attn builds with no isolation, so its build backend deps must be
+    # resolved into the project env alongside torch.
+    "setuptools",
+    "wheel",
+    "ninja",
+    "psutil",
+    "packaging",
+]
+
+# flash-attn's sdist imports torch at build time but does not declare it, so it
+# must build in the project env (torch already present), not an isolated one.
+# dependency-metadata lets uv lock/resolve it without building it just to read
+# its deps; the actual compile happens once at install time.
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+# CUDA torch (cu130) for the production-identical GPU reference path
+# (bf16 + flash_attention_2). Same resolved torch version as before, GPU build.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+gguf = { path = "../../../gguf-py", editable = true }
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+version = "2.8.3.post1"
+requires-dist = ["torch", "einops"]
