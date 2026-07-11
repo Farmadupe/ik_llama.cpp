@@ -404,7 +404,7 @@ int main(int argc, char ** argv) {
             embd_inp = session_tokens;
         }
 
-        LOG("prompt: \"%s\"\n", log_tostr(prompt));
+        // LOG("prompt: \"%s\"\n", log_tostr(prompt));
         LOG("tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
 
     }
@@ -499,7 +499,7 @@ int main(int argc, char ** argv) {
 
     if (params.verbose_prompt) {
         LOG_TEE("\n");
-        LOG_TEE("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
+        // LOG_TEE("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
         LOG_TEE("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
         for (int i = 0; i < (int) embd_inp.size(); i++) {
             LOG_TEE("%6d -> '%s'\n", embd_inp[i], common_token_to_piece(ctx, embd_inp[i]).c_str());

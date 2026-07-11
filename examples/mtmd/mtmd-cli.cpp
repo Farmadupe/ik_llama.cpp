@@ -260,7 +260,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg, bool add_
     tmpl_inputs.add_generation_prompt = true;
     tmpl_inputs.use_jinja = use_jinja; // jinja is buggy here
     auto formatted_chat = common_chat_templates_apply(ctx.tmpls.get(), tmpl_inputs);
-    LOG_DBG("formatted_chat.prompt: %s\n", formatted_chat.prompt.c_str());
+    // LOG_DBG("formatted_chat.prompt: %s\n", formatted_chat.prompt.c_str());
 
     mtmd_input_text text;
     text.text          = formatted_chat.prompt.c_str();

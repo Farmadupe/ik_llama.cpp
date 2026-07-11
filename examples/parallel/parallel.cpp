@@ -148,7 +148,7 @@ int main(int argc, char ** argv) {
             k_prompts.resize(index + 1);
             k_prompts[index] = prompt;
             index++;
-            printf("%3d prompt: %s\n", index, prompt.c_str());
+            // printf("%3d prompt: %s\n", index, prompt.c_str());
         }
     }
 

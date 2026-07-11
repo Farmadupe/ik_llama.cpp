@@ -5804,8 +5804,8 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "adaptive_target: %f # default: -1.0\n", sparams.adaptive_target);
     fprintf(stream, "adaptive_decay: %f # default: 0.9\n", sparams.adaptive_decay);
     fprintf(stream, "adaptive_updt_w_cur: %s # default: false\n", sparams.adaptive_updt_w_cur ? "true" : "false");
-    fprintf(stream, "verbose_prompt: %s # default: false\n", params.verbose_prompt ? "true" : "false");
-    fprintf(stream, "display_prompt: %s # default: true\n", params.display_prompt ? "true" : "false");
+    // fprintf(stream, "verbose_prompt: %s # default: false\n", params.verbose_prompt ? "true" : "false");
+    // fprintf(stream, "display_prompt: %s # default: true\n", params.display_prompt ? "true" : "false");
 }
 
 //
