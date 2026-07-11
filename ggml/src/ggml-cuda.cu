@@ -1941,13 +1941,23 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float alpha = 1.0f;
         const float beta = 0.0f;
 
+        // GGML_PREC_F32 asks for true fp32 GEMM precision: suppress the
+        // handle's TF32 math (10-bit mantissa) for this call only.
+        const bool no_tf32 = dst->op_params[0] == GGML_PREC_F32;
+
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        if (no_tf32) {
+            CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(id), CUBLAS_DEFAULT_MATH));
+        }
         CUBLAS_CHECK(
             cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
                     &alpha, src0_ddf_i,  ne00,
                             src1_ddf1_i, ne10,
                     &beta,  dst_dd_i,    ldc));
+        if (no_tf32) {
+            CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(id), CUBLAS_TF32_TENSOR_OP_MATH));
+        }
     }
 
     GGML_UNUSED(dst);
@@ -2475,6 +2485,14 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
     const int64_t r2 = ne12/ne02;
     const int64_t r3 = ne13/ne03;
 
+    // GGML_PREC_F32 on f32 inputs asks for true fp32 GEMM precision: suppress
+    // the handle's TF32 math (10-bit mantissa) around the batched GEMM.
+    // f16/bf16 inputs are unaffected by the math mode.
+    const bool no_tf32 = src0_type == GGML_TYPE_F32 && dst->op_params[0] == GGML_PREC_F32;
+    if (no_tf32) {
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
+    }
+
     if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         //printf("Using cublasGemmStridedBatchedEx for %s\n", dst->name);
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
@@ -2535,6 +2553,10 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
                 ne23,
                 cu_compute_type,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    if (no_tf32) {
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
     }
 
     // Convert output back to F32 if needed

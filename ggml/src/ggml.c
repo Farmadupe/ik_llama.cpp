@@ -22545,7 +22545,7 @@ static void ggml_compute_forward_upscale_f32(
         sf1 = ne1 > 1 && ne01 > 1 ? (float)(ne1 - 1) / (ne01 - 1) : sf1;
     }
 
-    if (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR) {
+    if (mode == GGML_SCALE_MODE_NEAREST) {
         for (int64_t i3 = 0; i3 < ne3; i3++) {
             const int64_t i03 = i3 / sf3;
             for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
@@ -22559,6 +22559,49 @@ static void ggml_compute_forward_upscale_f32(
                               float * y = (float *)((char *)  dst->data +  i0*nb0  +  i1*nb1  +  i2*nb2  +  i3*nb3);
 
                         *y = *x;
+                    }
+                }
+            }
+        }
+    } else if (mode == GGML_SCALE_MODE_BILINEAR) {
+        // port of mainline llama.cpp ggml-cpu/ops.cpp GGML_SCALE_MODE_BILINEAR
+        // (std::max/std::min replaced with GGML_CLAMP; no GGML_SCALE_FLAG_ANTIALIAS)
+        for (int64_t i3 = 0; i3 < ne3; i3++) {
+            const int64_t i03 = i3 / sf3;
+            for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
+                const int64_t i02 = i2 / sf2;
+                for (int64_t i1 = 0; i1 < ne1; i1++) {
+                    const float y = ((float)i1 + pixel_offset) / sf1 - pixel_offset;
+                    int64_t y0 = (int64_t)floorf(y);
+                    int64_t y1 = y0 + 1;
+
+                    y0 = GGML_CLAMP(y0, 0, ne01 - 1);
+                    y1 = GGML_CLAMP(y1, 0, ne01 - 1);
+
+                    float dy = y - (float)y0;
+                    dy = GGML_CLAMP(dy, 0.0f, 1.0f);
+
+                    for (int64_t i0 = 0; i0 < ne0; i0++) {
+                        const float x = ((float)i0 + pixel_offset) / sf0 - pixel_offset;
+                        int64_t x0 = (int64_t)floorf(x);
+                        int64_t x1 = x0 + 1;
+
+                        x0 = GGML_CLAMP(x0, 0, ne00 - 1);
+                        x1 = GGML_CLAMP(x1, 0, ne00 - 1);
+
+                        float dx = x - (float)x0;
+                        dx = GGML_CLAMP(dx, 0.0f, 1.0f);
+
+                        // fetch the four surrounding pixel values and interpolate
+                        const float a = *(const float *)((const char *)src0->data + x0*nb00 + y0*nb01 + i02*nb02 + i03*nb03);
+                        const float b = *(const float *)((const char *)src0->data + x1*nb00 + y0*nb01 + i02*nb02 + i03*nb03);
+                        const float c = *(const float *)((const char *)src0->data + x0*nb00 + y1*nb01 + i02*nb02 + i03*nb03);
+                        const float d = *(const float *)((const char *)src0->data + x1*nb00 + y1*nb01 + i02*nb02 + i03*nb03);
+
+                        const float val = a*(1 - dx)*(1 - dy) + b*dx*(1 - dy) + c*(1 - dx)*dy + d*dx*dy;
+
+                        float * y_dst = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+                        *y_dst = val;
                     }
                 }
             }

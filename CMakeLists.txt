@@ -79,6 +79,8 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_MINIMAX_PARITY "llama: build the MiniMax-M3 vision parity wrapper (test_minimax)" OFF)
+option(LLAMA_BUILD_STEP37_PARITY  "llama: build the Step-3.7-Flash vision parity wrapper (test_step37)" OFF)
 
 # 3rd party libs
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)

@@ -567,6 +567,10 @@ struct clip_graph {
     ggml_context * ctx0;
     ggml_cgraph * gf;
 
+    // lazily created flash-attention KV-pad mask, shared by every layer of
+    // the graph; see get_kv_pad_mask / build_attn
+    mutable ggml_tensor * kv_pad_mask = nullptr;
+
     clip_graph(clip_ctx * ctx, const clip_image_f32 & img, int nz) :
             ctx(ctx),
             model(ctx->model),
@@ -1693,6 +1697,122 @@ struct clip_graph {
         return gf;
     }
 
+    ggml_cgraph * build_step3vl() {
+        GGML_ASSERT(model.class_embedding == nullptr);
+        GGML_ASSERT(model.patch_embeddings_0 != nullptr);
+        GGML_ASSERT(model.position_embeddings != nullptr);
+
+        // 2D input positions
+        ggml_tensor * pos_h = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        ggml_set_name(pos_h, "pos_h");
+        ggml_set_input(pos_h);
+
+        ggml_tensor * pos_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        ggml_set_name(pos_w, "pos_w");
+        ggml_set_input(pos_w);
+
+        // Like MiniMax-M3's patch embedding: the generic convolution path
+        // rounds the im2col output to f16 when the kernel is f16, and the f16
+        // GEMM then accumulates in fp16 on CUDA. Keep the convolutions fully
+        // in f32; the f16 rounding at the patch-embedding input alone is
+        // amplified by the tower into the dominant f16 parity error.
+        auto conv_2d_f32 = [&](ggml_tensor * kernel, ggml_tensor * input, int stride, int pad) {
+            ggml_tensor * col = ggml_im2col(
+                ctx0, kernel, input,
+                stride, stride, pad, pad, 1, 1,
+                true, GGML_TYPE_F32);
+            ggml_tensor * cur = ggml_mul_mat(
+                ctx0,
+                ggml_reshape_2d(ctx0, col, col->ne[0], col->ne[3] * col->ne[2] * col->ne[1]),
+                ggml_reshape_2d(ctx0, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]));
+            cur = ggml_reshape_4d(ctx0, cur, col->ne[1], col->ne[2], col->ne[3], kernel->ne[3]);
+            return ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 1, 3, 2));
+        };
+
+        // patch embedding: f32-conv variant of build_inp()
+        ggml_tensor * inp = conv_2d_f32(model.patch_embeddings_0, build_inp_raw(), patch_size, 0);
+        inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
+        inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
+        if (model.patch_bias) {
+            inp = ggml_add(ctx0, inp, model.patch_bias);
+            cb(inp, "patch_bias", -1);
+        }
+
+        ggml_tensor * learned_pos_embd = resize_position_embeddings(GGML_SCALE_MODE_BILINEAR);
+
+        auto add_pos = [&](ggml_tensor * cur, const clip_layer &) {
+            return build_rope_2d(ctx0, cur, pos_w, pos_h, hparams.rope_theta, false);
+        };
+
+        auto add_spatial_bias = [&](ggml_tensor * cur, ggml_tensor * bias) {
+            if (bias == nullptr) {
+                return cur;
+            }
+
+            const int64_t width    = cur->ne[0];
+            const int64_t height   = cur->ne[1];
+            const int64_t channels = cur->ne[2];
+
+            cur = ggml_reshape_2d(ctx0, cur, width * height, channels);
+            cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+            cur = ggml_add(ctx0, cur, bias);
+            cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+            cur = ggml_reshape_3d(ctx0, cur, width, height, channels);
+
+            return cur;
+        };
+
+        ggml_tensor * cur = build_vit(
+                                inp, n_patches,
+                                NORM_TYPE_NORMAL,
+                                hparams.ffn_op,
+                                learned_pos_embd,
+                                add_pos);
+        cb(cur, "vit_out", -1);
+
+        // [n_embd, n_patches] reshaped to [w, h, n_embd] for spatial downsampling convolutions
+        cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
+        cur = ggml_cont_3d(ctx0, cur, n_patches_x, n_patches_y, n_embd);
+
+        // First downsampler: Conv2d(1536 to 3072, k=3, s=2, p=1)
+        cur = conv_2d_f32(model.mm_0_w, cur, 2, 1);
+        cur = add_spatial_bias(cur, model.mm_0_b);
+        cb(cur, "downsample_0", -1);
+
+        // Second downsampler: Conv2d(3072 to 6144, k=3, s=2, p=1)
+        cur = conv_2d_f32(model.mm_1_w, cur, 2, 1);
+        cur = add_spatial_bias(cur, model.mm_1_b);
+        cb(cur, "downsample_1", -1);
+
+        // [w, h, c] flattened to [c, w*h]
+        {
+            const int64_t w = cur->ne[0];
+            const int64_t h = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, w * h, cur->ne[2], cur->ne[3]);
+            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3));
+        }
+        cb(cur, "downsample_flatten", -1);
+
+        // Final projector: Linear(6144 to projection_dim)
+        cur = ggml_mul_mat(ctx0, model.mm_model_proj, cur);
+        cb(cur, "projector_out", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        // Force f32 GEMM precision on every matmul: with f16 weights the CUDA
+        // fast path otherwise rounds the activations to f16 and accumulates in
+        // fp16 (CUBLAS_COMPUTE_16F), which measurably hurts parity against the
+        // fp32 reference.
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op == GGML_OP_MUL_MAT) {
+                ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+            }
+        }
+
+        return gf;
+    }
+
     ggml_cgraph * build_kimik25() {
         // For video chunks the ViT sees nz frames jointly: n_patches per frame, nz frames,
         // laid out frame-major. Positions repeat the per-frame 2D grid for each frame.
@@ -2761,6 +2881,29 @@ private:
         return cur;
     }
 
+    // The CUDA flash-attention kernels require the KV length padded to a
+    // multiple of FATTN_KQ_STRIDE (256); vision graphs attend over n_patches
+    // rows, which is rarely aligned. build_attn pads K/V with zero rows and
+    // masks them off with the -inf columns of this shared input tensor,
+    // filled generically in clip_image_batch_encode. The real (unmasked) KV
+    // length rides along in op_params[0] so the fill code does not need to
+    // re-derive it per projector.
+    ggml_tensor * get_kv_pad_mask(int64_t n_kv, int64_t n_kv_padded, int64_t n_q) const {
+        const int64_t n_q_pad = GGML_PAD(n_q, GGML_KQ_MASK_PAD);
+        if (kv_pad_mask) {
+            // one mask per graph: every layer of the current encoders attends
+            // over the same KV; a per-shape mask map would be needed otherwise
+            GGML_ASSERT(kv_pad_mask->ne[0] == n_kv_padded && kv_pad_mask->ne[1] >= n_q_pad);
+            return kv_pad_mask;
+        }
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_padded, n_q_pad);
+        ggml_set_name(mask, "kv_pad_mask");
+        ggml_set_input(mask);
+        mask->op_params[0] = (int32_t) n_kv; // unused for input tensors, safe to carry metadata
+        kv_pad_mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        return kv_pad_mask;
+    }
+
     ggml_tensor * build_attn(
             ggml_tensor * wo,
             ggml_tensor * wo_b,
@@ -2786,6 +2929,23 @@ private:
 
         if (ctx->flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
             ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
+
+            // pad the KV length to FATTN_KQ_STRIDE (see get_kv_pad_mask):
+            // zero rows appended to K/V, -inf mask columns keep them out of
+            // the softmax. Only wired for the mask-less full-attention case;
+            // window-attention graphs pass their own mask sized to the
+            // unpadded KV and keep the old layout, which the CUDA backend now
+            // refuses so the scheduler falls back to the CPU kernel instead
+            // of asserting mid-compute.
+            const int64_t n_kv     = k->ne[1];
+            const int64_t n_kv_pad = GGML_PAD(n_kv, 256) - n_kv;
+            if (n_kv_pad > 0 && kq_mask == nullptr) {
+                kq_mask = get_kv_pad_mask(n_kv, n_kv + n_kv_pad, q->ne[1]);
+                // ggml_pad is f32-only and wants plain data, so pad the
+                // contiguous f32 copy before the f16 cast
+                k = ggml_pad(ctx0, ggml_cont(ctx0, k), 0, n_kv_pad, 0, 0);
+                v = ggml_pad(ctx0, ggml_cont(ctx0, v), 0, n_kv_pad, 0, 0);
+            }
 
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
@@ -3079,6 +3239,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         case PROJECTOR_TYPE_KIMIVL:
             {
                 res = graph.build_kimivl();
+            } break;
+        case PROJECTOR_TYPE_STEP3VL:
+            {
+                res = graph.build_step3vl();
             } break;
         case PROJECTOR_TYPE_KIMIK25:
             {
@@ -3375,6 +3539,18 @@ struct clip_model_loader {
                         // TODO: check kimivl preprocessor for exact values
                         hparams.set_limit_image_tokens(8, 1024);
                         hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                    } break;
+                case PROJECTOR_TYPE_STEP3VL:
+                    {
+                        hparams.n_merge = 4; // two stride-2 downsamplers after patching
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                        hparams.rope_theta = 10000.0f;
+                        get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        if (hparams.image_longest_edge == 0) {
+                            hparams.image_longest_edge = 3024;
+                        }
+                        // overview images are always image_size x image_size; slices are smaller
+                        hparams.warmup_image_size = hparams.image_size;
                     } break;
                 case PROJECTOR_TYPE_KIMIK25:
                     {
@@ -3893,6 +4069,15 @@ struct clip_model_loader {
                     model.mm_model_proj    = get_tensor(TN_MM_PROJECTOR);
                     model.mm_model_mlp_1_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 1, "weight"));
                     model.mm_model_mlp_2_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 2, "weight"));
+                } break;
+            case PROJECTOR_TYPE_STEP3VL:
+                {
+                    // two Conv2d downsamplers followed by a linear projector
+                    model.mm_0_w        = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b        = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
+                    model.mm_1_w        = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_1_b        = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"), false);
+                    model.mm_model_proj = get_tensor(TN_MM_PROJECTOR);
                 } break;
             case PROJECTOR_TYPE_COGVLM:
                 {
@@ -4816,6 +5001,226 @@ private:
     }
 };
 
+// custom image preprocessing for Step3VL (Step3-VL-10B, Step-3.7-Flash)
+// ref: https://huggingface.co/stepfun-ai/Step3-VL-10B/blob/main/processing_step3.py
+// output batch layout: entries[0] is the overview image (image_size x image_size),
+// followed by grid_x * grid_y slice crops (504 x 504), row-major
+struct step3vl_preproc {
+    static constexpr int   default_image_crop_size  = 504;
+    static constexpr float small_aspect_ratio_limit = 1.5f;
+    static constexpr float wide_aspect_ratio_limit  = 4.0f;
+    static constexpr float crop_rounding_threshold  = 0.2f;
+
+    struct slice_coordinates {
+        int x;
+        int y;
+        clip_image_size size;
+    };
+
+    struct slice_instructions {
+        clip_image_size overview_size;
+        clip_image_size refined_size;
+        clip_image_size grid_size;
+        std::vector<slice_coordinates> slices;
+    };
+
+    static int determine_window_size(const clip_hparams & params, int longer, int shorter) {
+        const int image_size = params.image_size;
+        const int crop_size  = default_image_crop_size;
+        const float aspect_ratio = static_cast<float>(longer) / shorter;
+
+        if (longer <= image_size) {
+            return aspect_ratio > small_aspect_ratio_limit ? shorter : 0;
+        }
+
+        return aspect_ratio > wide_aspect_ratio_limit ? std::min(shorter, crop_size) : crop_size;
+    }
+
+    static int calc_crop_extent(int length, int window_size) {
+        const float ratio = static_cast<float>(length) / window_size;
+        if (ratio < 1.0f) {
+            return length;
+        }
+
+        const float decimal = ratio - std::floor(ratio);
+        const int rounded = decimal > crop_rounding_threshold
+            ? static_cast<int>(std::floor(ratio)) + 1
+            : static_cast<int>(std::floor(ratio));
+        return window_size * rounded;
+    }
+
+    static std::vector<int> calc_grid(int length, int window_size) {
+        const int n = length <= window_size
+            ? 1
+            : static_cast<int>(std::ceil(static_cast<float>(length - window_size) / window_size + 1.0f));
+        std::vector<int> starts(n);
+
+        for (int i = 0; i < n; ++i) {
+            starts[i] = window_size * i;
+        }
+
+        if (n > 1 && starts.back() + window_size > length) {
+            starts.back() = length - window_size;
+        }
+
+        return starts;
+    }
+
+    // square-pad tiny extreme-aspect images, then cap the longest edge
+    static clip_image_u8 prepare_image(const clip_image_u8 & img, const clip_hparams & params) {
+        clip_image_u8 resized = img;
+        const float aspect_ratio = img.ny > 0 ? static_cast<float>(img.nx) / img.ny : 1.0f;
+        if (std::min(img.nx, img.ny) < 32 &&
+            (aspect_ratio > wide_aspect_ratio_limit ||
+             aspect_ratio < 1.0f / wide_aspect_ratio_limit)) {
+            const int square_size = std::max(img.nx, img.ny);
+            clip_image_u8 padded;
+            padded.nx = square_size;
+            padded.ny = square_size;
+            padded.buf.resize(3 * square_size * square_size);
+            img_tool::fill(padded, {0, 0, 0});
+            img_tool::composite(padded, img, 0, 0);
+            resized = std::move(padded);
+        }
+
+        const int max_image_size = params.image_longest_edge;
+        if (std::max(resized.nx, resized.ny) > max_image_size) {
+            const float scale = static_cast<float>(max_image_size) / std::max(resized.nx, resized.ny);
+            const clip_image_size new_size = {
+                std::max(1, static_cast<int>(std::floor(resized.nx * scale))),
+                std::max(1, static_cast<int>(std::floor(resized.ny * scale))),
+            };
+            clip_image_u8 scaled;
+            img_tool::resize(resized, scaled, new_size, img_tool::RESIZE_ALGO_BILINEAR, false);
+            resized = std::move(scaled);
+        }
+
+        return resized;
+    }
+
+    // crop [x, x+w) x [y, y+h); any part extending past the source is padded with black
+    static clip_image_u8 crop_with_black_padding(const clip_image_u8 & image, int x, int y, int w, int h) {
+        clip_image_u8 dst;
+        dst.nx = w;
+        dst.ny = h;
+        dst.buf.resize(3 * w * h, 0);
+
+        const int src_x0 = std::max(0, x);
+        const int src_y0 = std::max(0, y);
+        const int src_x1 = std::min(image.nx, x + w);
+        const int src_y1 = std::min(image.ny, y + h);
+
+        if (src_x0 >= src_x1 || src_y0 >= src_y1) {
+            return dst;
+        }
+
+        const int dst_x0 = src_x0 - x;
+        const int dst_y0 = src_y0 - y;
+
+        for (int yy = 0; yy < src_y1 - src_y0; ++yy) {
+            for (int xx = 0; xx < src_x1 - src_x0; ++xx) {
+                const int src_idx = 3 * ((src_y0 + yy) * image.nx + (src_x0 + xx));
+                const int dst_idx = 3 * ((dst_y0 + yy) * w + (dst_x0 + xx));
+                dst.buf[dst_idx + 0] = image.buf[src_idx + 0];
+                dst.buf[dst_idx + 1] = image.buf[src_idx + 1];
+                dst.buf[dst_idx + 2] = image.buf[src_idx + 2];
+            }
+        }
+
+        return dst;
+    }
+
+    static slice_instructions build_slice_instructions(
+            const clip_hparams & params,
+            const clip_image_size & prepared_size) {
+        slice_instructions instructions;
+        instructions.overview_size = prepared_size;
+
+        const int window_size = determine_window_size(
+            params,
+            std::max(prepared_size.width, prepared_size.height),
+            std::min(prepared_size.width, prepared_size.height));
+        if (window_size <= 0) {
+            instructions.refined_size = clip_image_size{0, 0};
+            instructions.grid_size    = clip_image_size{0, 0};
+            return instructions;
+        }
+
+        const int crop_width  = calc_crop_extent(prepared_size.width,  window_size);
+        const int crop_height = calc_crop_extent(prepared_size.height, window_size);
+        instructions.refined_size = clip_image_size{crop_width, crop_height};
+
+        const auto xs = calc_grid(crop_width,  window_size);
+        const auto ys = calc_grid(crop_height, window_size);
+        instructions.grid_size = clip_image_size{
+            static_cast<int>(xs.size()),
+            static_cast<int>(ys.size()),
+        };
+
+        for (int y : ys) {
+            for (int x : xs) {
+                instructions.slices.push_back(slice_coordinates{
+                    /* x    */ x,
+                    /* y    */ y,
+                    /* size */ clip_image_size{window_size, window_size},
+                });
+            }
+        }
+
+        return instructions;
+    }
+
+    static bool preprocess(const clip_image_u8 & img, const clip_hparams & params, clip_image_f32_batch & output) {
+        clip_image_u8 prepared = prepare_image(img, params);
+        const auto instructions = build_slice_instructions(params, {prepared.nx, prepared.ny});
+
+        // final squash to image_size x image_size: the reference applies torchvision
+        // Resize(BILINEAR, antialias=True) (Step3VisionProcessor is instantiated with
+        // "bilinear"), which is the same support-scaled triangle filter as stb's
+        clip_image_u8 overview_u8;
+        img_tool::resize(prepared, overview_u8, {params.image_size, params.image_size},
+                         img_tool::RESIZE_ALGO_BILINEAR, false);
+
+        clip_image_f32_ptr overview_f32(clip_image_f32_init());
+        normalize_image_u8_to_f32(overview_u8, *overview_f32, params.image_mean, params.image_std);
+        output.entries.push_back(std::move(overview_f32));
+
+        if (instructions.slices.empty()) {
+            output.grid_x = 0;
+            output.grid_y = 0;
+            return true;
+        }
+
+        clip_image_u8 img_for_crop = prepared;
+        if (instructions.refined_size.width != prepared.nx || instructions.refined_size.height != prepared.ny) {
+            clip_image_u8 refined;
+            img_tool::resize(prepared, refined, instructions.refined_size, img_tool::RESIZE_ALGO_BILINEAR, false);
+            img_for_crop = std::move(refined);
+        }
+
+        const int crop_size = default_image_crop_size;
+        for (const auto & slice : instructions.slices) {
+            clip_image_u8 patch = crop_with_black_padding(img_for_crop, slice.x, slice.y, slice.size.width, slice.size.height);
+
+            // windows smaller than the crop size are upscaled; the reference patch
+            // transform is the same bilinear as the overview (identity when the
+            // window already matches crop_size)
+            clip_image_u8 patch_resized;
+            img_tool::resize(patch, patch_resized, {crop_size, crop_size},
+                             img_tool::RESIZE_ALGO_BILINEAR, false);
+
+            clip_image_f32_ptr patch_f32(clip_image_f32_init());
+            normalize_image_u8_to_f32(patch_resized, *patch_f32, params.image_mean, params.image_std);
+            output.entries.push_back(std::move(patch_f32));
+        }
+
+        output.grid_x = instructions.grid_size.width;
+        output.grid_y = instructions.grid_size.height;
+
+        return true;
+    }
+};
+
 bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, struct clip_image_f32_batch * res_imgs) {
     clip_image_size original_size{img->nx, img->ny};
     auto & params = ctx->model.hparams;
@@ -5009,6 +5414,14 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 res_imgs->entries.push_back(std::move(res));
             } break;
 
+        case PROJECTOR_TYPE_STEP3VL:
+            {
+                GGML_ASSERT(params.image_longest_edge > 0);
+                if (!step3vl_preproc::preprocess(*img, params, *res_imgs)) {
+                    return false;
+                }
+            } break;
+
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_LDP:
@@ -5200,6 +5613,15 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                 int y_patch = CLIP_ALIGN(img->ny, out_patch_size) / out_patch_size;
                 n_patches = x_patch * y_patch;
             } break;
+        case PROJECTOR_TYPE_STEP3VL:
+            {
+                // images are always exact multiples: 728px overview (13x13 tokens),
+                // 504px slices (9x9 tokens)
+                int out_patch_size = params.patch_size * ctx->model.hparams.n_merge;
+                int x_patch = img->nx / out_patch_size;
+                int y_patch = img->ny / out_patch_size;
+                n_patches = x_patch * y_patch;
+            } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
             {
@@ -5338,6 +5760,30 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
     imgs.entries.push_back(std::move(img_copy));
 
     return clip_image_batch_encode(ctx, n_threads, &imgs, vec);
+}
+
+bool clip_image_slice_encode(struct clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs, float * vec) {
+    switch (ctx->proj_type()) {
+        case PROJECTOR_TYPE_STEP3VL:
+            {
+                // entries are independent views (overview + slice crops); each gets its
+                // own graph, since sizes differ (728px overview vs 504px slices) and the
+                // model has no cross-view attention
+                const int n_embd = clip_n_mmproj_embd(ctx);
+                float * out = vec;
+                for (const auto & entry : imgs->entries) {
+                    if (!clip_image_encode(ctx, n_threads, entry.get(), out)) {
+                        return false;
+                    }
+                    out += (size_t) clip_n_output_tokens(ctx, entry.get()) * n_embd;
+                }
+                return true;
+            } break;
+        // TODO: move the other slice-based encoders (llava, minicpmv, glm) here,
+        //       out of mtmd_encode_image_into's special case
+        default:
+            GGML_ABORT("clip_image_slice_encode: unimplemented projector type %d", ctx->proj_type());
+    }
 }
 
 bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec) {
@@ -5615,6 +6061,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_LIGHTONOCR:
+        case PROJECTOR_TYPE_STEP3VL:
             {
                 // set the 2D positions
                 int n_patches_per_col = image_size_width / patch_size;
@@ -5769,6 +6216,24 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             GGML_ABORT("Unknown projector type");
     }
 
+    // flash-attention KV-pad mask (see clip_graph::get_kv_pad_mask): zero for
+    // the real KV columns, -inf for the columns that pad the KV length to
+    // FATTN_KQ_STRIDE. Projector-agnostic: present in the graph only when
+    // build_attn had to pad.
+    if (ggml_tensor * mask = ggml_graph_get_tensor(gf, "kv_pad_mask")) {
+        const int64_t n_kv_padded = mask->ne[0];
+        const int64_t n_rows      = mask->ne[1];
+        const int32_t n_kv        = mask->op_params[0];
+        GGML_ASSERT(n_kv > 0 && n_kv <= n_kv_padded);
+        std::vector<float> vals((size_t) n_kv_padded * n_rows, 0.0f);
+        for (int64_t r = 0; r < n_rows; r++) {
+            for (int64_t c = n_kv; c < n_kv_padded; c++) {
+                vals[r * n_kv_padded + c] = -INFINITY;
+            }
+        }
+        set_input_f32("kv_pad_mask", vals);
+    }
+
     if (ctx->backend_cpu) {
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
     }
@@ -5783,6 +6248,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     //}
 
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
@@ -5844,6 +6310,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_INTERNVL:
             return ctx->model.mm_3_w->ne[1];
         case PROJECTOR_TYPE_LLAMA4:
+        case PROJECTOR_TYPE_STEP3VL:
             return ctx->model.mm_model_proj->ne[1];
         case PROJECTOR_TYPE_QWEN2A:
             return ctx->model.mm_fc_w->ne[1];

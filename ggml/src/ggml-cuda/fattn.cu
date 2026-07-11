@@ -181,6 +181,13 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
+    // every kernel family goes through launch_fattn, which asserts this
+    // padding; unpadded KV (e.g. vision encoder graphs) must be refused here
+    // so the scheduler can fall back instead of aborting at compute time
+    if (K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
