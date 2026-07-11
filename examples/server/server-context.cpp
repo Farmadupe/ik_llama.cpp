@@ -4799,6 +4799,30 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // planes for the sub-range)
         llama_batch batch_view = batch_embd->get_view(i, n_tokens);
 
+        // Feed the decoder the request-level prefill remainder: every prompt
+        // token across all slots not yet decoded, including the rows of this
+        // view. llama_decode counts it down per ubatch so its progress log can
+        // predict the time left for the whole prefill, not just this batch.
+        {
+            uint32_t n_awaiting = 0;
+            for (const auto & s : slots) {
+                int32_t rem = s.n_prompt_tokens - s.n_past_prompt;
+                if (s.prompt_batch_i0 >= 0 && s.prompt_batch_i1 > s.prompt_batch_i0) {
+                    if (s.mm_stream) {
+                        // stream rows: n_past_prompt lags until the post-decode
+                        // mirror; discount rows already decoded by earlier views
+                        rem -= std::max(0, std::min(s.prompt_batch_i1, i) - s.prompt_batch_i0);
+                    } else {
+                        // text rows: n_past_prompt was advanced at staging time;
+                        // count back the staged rows not yet decoded
+                        rem += std::max(0, s.prompt_batch_i1 - std::max(s.prompt_batch_i0, i));
+                    }
+                }
+                n_awaiting += (uint32_t) std::max(0, rem);
+            }
+            llama_set_prefill_remaining(ctx, n_awaiting);
+        }
+
         // solo non-causal media round (gemma3 family): the whole batch is
         // image/audio rows of whole chunks; causal attention is restored on
         // every path out of the decode
@@ -4909,6 +4933,18 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 slot.n_past_prompt              = (int32_t) boundary;
                 slot.n_prompt_tokens_processed += consumed;
                 slot.image_just_processed = slot.prompt_tokens[boundary - 1] == LLAMA_TOKEN_NULL;
+
+                const double dt_s = (double)(ggml_time_us() - slot.t_start_process_prompt) / 1.0e6;
+                const double tps  = slot.n_prompt_tokens_processed / (dt_s + 1e-9);
+                // ETA from the context's prefill-time predictor, which is position-aware
+                // and so anticipates the per-batch slowdown as the context deepens.
+                const int32_t   n_remaining = slot.n_prompt_tokens - slot.n_past_prompt;
+                const llama_pos pos_next    = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past;
+                const double eta_sec = llama_predict_prefill_seconds(ctx, n_remaining, pos_next);
+                LLAMA_LOG_INFO("slot %d: multimodal prefill %d/%d tokens (%d%%), %.1f tok/s, eta %02d:%02d\n",
+                        slot.id, slot.n_past_prompt, slot.n_prompt_tokens,
+                        (int)((int64_t) slot.n_past_prompt * 100 / std::max(1, slot.n_prompt_tokens)),
+                        tps, (int)(eta_sec / 60.0), (int) std::fmod(eta_sec, 60.0));
             }
             if (mtmd_helper_embd_stream_done(slot.mm_stream)) {
                 mtmd_helper_embd_stream_free(slot.mm_stream);
