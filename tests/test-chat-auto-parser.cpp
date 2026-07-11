@@ -67,6 +67,7 @@ static void test_cohere2moe_parser(testing & t);
 
 // End-to-end MiniMax-M3 dedicated PEG parser coverage.
 static void test_minimax_m3_partial_reasoning_parser(testing & t);
+static void test_minimax_m3_thinking_disabled_prefill(testing & t);
 
 // SmolLM3 template analysis tests
 static void test_smollm3_analysis(testing & t);
@@ -107,6 +108,7 @@ int main(int argc, char * argv[]) {
     t.test("cohere", test_cohere_analysis);
     t.test("cohere2moe_parser", test_cohere2moe_parser);
     t.test("minimax_m3_partial_reasoning_parser", test_minimax_m3_partial_reasoning_parser);
+    t.test("minimax_m3_thinking_disabled_prefill", test_minimax_m3_thinking_disabled_prefill);
     t.test("nemotron", test_nemotron_analysis);
     t.test("smollm3", test_smollm3_analysis);
     t.test("standard_json_tools", test_standard_json_tools_formats);
@@ -2160,6 +2162,166 @@ static void test_minimax_m3_partial_reasoning_parser(testing & t) {
     streamed_as_content.content = migrated_prefix;
     auto migrated_diffs = common_chat_msg_diff::compute_diffs(streamed_as_content, migrated_reasoning_msg);
     t.assert_equal("migrated prefix emits no duplicate diff", 0u, migrated_diffs.size());
+}
+
+// MiniMax-M3 disabled thinking mode: the vendor template prefills </mm:think>
+// at the end of the generation prompt (thinking_mode="disabled") and the
+// reference implementation treats the entire completion as content. The parser
+// must not classify untagged output as reasoning when the generation prompt
+// already closed the think block. Also covers the enable_thinking bridge and
+// the adaptive default where the model emits the tags itself.
+static void test_minimax_m3_thinking_disabled_prefill(testing & t) {
+    const std::string template_str = R"(
+{%- set ns_token = ']<]minimax[>[' -%}
+{%- set toolcall_begin_token = ns_token ~ '<tool_call>' -%}
+{%- set toolcall_end_token = ns_token ~ '</tool_call>' -%}
+{%- for message in messages -%}
+{{- message.role ~ ': ' ~ message.content ~ '\n' -}}
+{%- endfor -%}
+{%- if tools -%}
+{{- toolcall_begin_token ~ ns_token ~ '<invoke name="example">' ~ ns_token ~ '</invoke>' ~ toolcall_end_token -}}
+{%- endif -%}
+{%- if add_generation_prompt -%}
+{{- 'ai: ' -}}
+{%- if thinking_mode is defined and thinking_mode == "disabled" -%}
+{{- '</mm:think>' -}}
+{%- elif thinking_mode is defined and thinking_mode == "enabled" -%}
+{{- '<mm:think>' -}}
+{%- endif -%}
+{%- endif -%}
+)";
+
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "What is the capital of France?";
+
+    common_chat_templates_ptr tmpls(common_chat_templates_init(/* model = */ nullptr, template_str));
+
+    const std::string reply   = "The capital of France is Paris.";
+    const std::string prefill = "</mm:think>";
+    auto ends_with_prefill = [&](const std::string & s) {
+        return s.size() >= prefill.size() &&
+               s.compare(s.size() - prefill.size(), prefill.size(), prefill) == 0;
+    };
+
+    // thinking_mode="disabled" via chat_template_kwargs: the generation prompt
+    // ends with the prefilled close tag and the completion is pure content.
+    common_chat_templates_inputs inputs;
+    inputs.messages              = { user };
+    inputs.add_generation_prompt = true;
+    inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+    inputs.enable_thinking       = true;
+    inputs.chat_template_kwargs["thinking_mode"] = "\"disabled\"";
+
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+    t.assert_equal("disabled parser selected", COMMON_CHAT_FORMAT_PEG_MINIMAX_M3, params.format);
+    t.assert_true("disabled generation prompt is prefilled", ends_with_prefill(params.generation_prompt));
+
+    common_peg_arena arena;
+    arena.load(params.parser);
+    common_chat_parser_params parser_params(params);
+    parser_params.parser = arena;
+
+    auto full_msg = common_chat_parse(reply, /* is_partial = */ false, parser_params);
+    t.assert_equal("disabled full reply is content", reply, full_msg.content);
+    t.assert_equal("disabled full reply has no reasoning", std::string(), full_msg.reasoning_content);
+    t.assert_true("disabled full reply has no tool calls", full_msg.tool_calls.empty());
+
+    auto partial_msg = common_chat_parse(reply.substr(0, 14), /* is_partial = */ true, parser_params);
+    t.assert_equal("disabled partial reply streams as content", reply.substr(0, 14), partial_msg.content);
+    t.assert_equal("disabled partial reply has no reasoning", std::string(), partial_msg.reasoning_content);
+
+    auto reopened_msg = common_chat_parse("<mm:think>Recalling.</mm:think>" + reply,
+                                          /* is_partial = */ false, parser_params);
+    t.assert_equal("disabled reopened block is reasoning", std::string("Recalling."), reopened_msg.reasoning_content);
+    t.assert_equal("disabled reopened block content", reply, reopened_msg.content);
+
+    // enable_thinking=false bridges to thinking_mode="disabled".
+    common_chat_templates_inputs bridge_inputs;
+    bridge_inputs.messages              = { user };
+    bridge_inputs.add_generation_prompt = true;
+    bridge_inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+    bridge_inputs.enable_thinking       = false;
+
+    auto bridge_params = common_chat_templates_apply(tmpls.get(), bridge_inputs);
+    t.assert_true("bridge generation prompt is prefilled", ends_with_prefill(bridge_params.generation_prompt));
+
+    common_peg_arena bridge_arena;
+    bridge_arena.load(bridge_params.parser);
+    common_chat_parser_params bridge_parser_params(bridge_params);
+    bridge_parser_params.parser = bridge_arena;
+
+    auto bridge_msg = common_chat_parse(reply, /* is_partial = */ false, bridge_parser_params);
+    t.assert_equal("bridge full reply is content", reply, bridge_msg.content);
+    t.assert_equal("bridge full reply has no reasoning", std::string(), bridge_msg.reasoning_content);
+
+    // Default (adaptive): no prefill; the model emits the tags itself and both
+    // trained output forms keep working.
+    common_chat_templates_inputs adaptive_inputs;
+    adaptive_inputs.messages              = { user };
+    adaptive_inputs.add_generation_prompt = true;
+    adaptive_inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+    adaptive_inputs.enable_thinking       = true;
+
+    auto adaptive_params = common_chat_templates_apply(tmpls.get(), adaptive_inputs);
+    t.assert_true("adaptive generation prompt has no think tags",
+        adaptive_params.generation_prompt.find("mm:think") == std::string::npos);
+
+    common_peg_arena adaptive_arena;
+    adaptive_arena.load(adaptive_params.parser);
+    common_chat_parser_params adaptive_parser_params(adaptive_params);
+    adaptive_parser_params.parser = adaptive_arena;
+
+    auto no_think_msg = common_chat_parse(prefill + reply, /* is_partial = */ false, adaptive_parser_params);
+    t.assert_equal("adaptive no-think reply is content", reply, no_think_msg.content);
+    t.assert_equal("adaptive no-think reply has no reasoning", std::string(), no_think_msg.reasoning_content);
+
+    auto think_msg = common_chat_parse("<mm:think>Recalling.</mm:think>" + reply,
+                                       /* is_partial = */ false, adaptive_parser_params);
+    t.assert_equal("adaptive think reply reasoning", std::string("Recalling."), think_msg.reasoning_content);
+    t.assert_equal("adaptive think reply content", reply, think_msg.content);
+
+    // Disabled + tools: the tool call still parses; the prelude keeps M3's
+    // action-phase convention (the mapper folds it into reasoning).
+    common_chat_templates_inputs tool_inputs;
+    tool_inputs.messages              = { user };
+    tool_inputs.add_generation_prompt = true;
+    tool_inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+    tool_inputs.enable_thinking       = true;
+    tool_inputs.chat_template_kwargs["thinking_mode"] = "\"disabled\"";
+    tool_inputs.tools = {
+        common_chat_tool{
+            /* .name        = */ "bash",
+            /* .description = */ "Run shell commands",
+            /* .parameters  = */ R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})",
+        },
+    };
+
+    auto tool_params = common_chat_templates_apply(tmpls.get(), tool_inputs);
+    t.assert_true("disabled tool generation prompt is prefilled", ends_with_prefill(tool_params.generation_prompt));
+
+    common_peg_arena tool_arena;
+    tool_arena.load(tool_params.parser);
+    common_chat_parser_params tool_parser_params(tool_params);
+    tool_parser_params.parser = tool_arena;
+
+    const std::string tool_output =
+        "Checking the disk."
+        "]<]minimax[>[<tool_call>\n"
+        "]<]minimax[>[<invoke name=\"bash\">"
+        "]<]minimax[>[<command>df -h]<]minimax[>[</command>"
+        "]<]minimax[>[</invoke>\n"
+        "]<]minimax[>[</tool_call>";
+
+    auto tool_msg = common_chat_parse(tool_output, /* is_partial = */ false, tool_parser_params);
+    t.assert_equal("disabled tool call count", 1u, tool_msg.tool_calls.size());
+    if (tool_msg.tool_calls.size() == 1) {
+        t.assert_equal("disabled tool call name", std::string("bash"), tool_msg.tool_calls[0].name);
+        t.assert_equal("disabled tool call args", json({{"command", "df -h"}}).dump(), tool_msg.tool_calls[0].arguments);
+    }
+    t.assert_equal("disabled tool prelude keeps action-phase convention",
+        std::string("Checking the disk."), tool_msg.reasoning_content);
+    t.assert_equal("disabled tool visible content", std::string(), tool_msg.content);
 }
 
 // End-to-end coverage for the dedicated Cohere2MoE (North Code) parser:
