@@ -317,6 +317,12 @@ struct mtmd_context {
             img_beg = "<|vision_start|>";
             img_end = "<|vision_end|>";
 
+        } else if (proj == PROJECTOR_TYPE_GLM5NEXT) {
+            // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
+            // video has its own token pair in the template, but is not supported here
+            img_beg = "<|begin_of_image|>";
+            img_end = "<|end_of_image|>";
+
         } else if (proj == PROJECTOR_TYPE_MINIMAX_M3_VL) {
             // ]<]start of image[>[ ... (image embeddings) ... ]<]end of image[>[
             img_beg = "]<]start of image[>[";

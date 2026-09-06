@@ -20647,10 +20647,6 @@ static void ggml_compute_forward_clamp_f32(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
     float min;
     float max;
     memcpy(&min, (float *) dst->op_params + 0, sizeof(float));
@@ -21254,7 +21250,10 @@ static void ggml_compute_forward_rope_f32(
                     }
                 }
 
-                if (is_inplace) {
+                // the non-vision tail below only copies the unrotated channels, which an
+                // in-place rope already has in place; the vision tail is a real rotation, so
+                // it has to run either way (it reads both halves of each pair before writing)
+                if (is_inplace && !is_vision) {
                     continue;
                 }
 

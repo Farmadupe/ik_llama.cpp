@@ -18,10 +18,12 @@ naming:
 | `kimik25`              | `PROJECTOR_TYPE_KIMIK25`       | [`moonshotai/Kimi-K2.7-Code`](https://huggingface.co/moonshotai/Kimi-K2.7-Code) |
 | `minimax_m3_vl`        | `PROJECTOR_TYPE_MINIMAX_M3_VL` | [`MiniMaxAI/MiniMax-M3`](https://huggingface.co/MiniMaxAI/MiniMax-M3)            |
 | `step3vl`              | `PROJECTOR_TYPE_STEP3VL`       | [`stepfun-ai/Step-3.7-Flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash) |
+| `glm5next`             | `PROJECTOR_TYPE_GLM5NEXT`      | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash)          |
 
 The convert scripts and `ref_encode.py` still reference the real checkpoint's
-own class and module names (e.g. `KimiK25*`, `MiniMaxM3VL*`, `Step3p7*`) because
-they load it directly; those are functional, not naming choices.
+own class and module names (e.g. `KimiK25*`, `MiniMaxM3VL*`, `Step3p7*`,
+`Glm5Next*`) because they load it directly; those are functional, not naming
+choices.
 
 ## Layout
 
@@ -36,9 +38,9 @@ Top-level (`tests/mtmd-encoder/`):
   model-agnostic steps run here in-process; the model-specific steps shell out to
   each family's own venv.
 - `src/` - the orchestrator's modules:
-  - `src/<family>.py` - one per family (`kimik25`, `minimax_m3_vl`, `step3vl`),
-    each exporting `HARNESS_CONFIG`: reference repo + file list, convert-script
-    path, compare label, default images. All three currently point
+  - `src/<family>.py` - one per family (`kimik25`, `minimax_m3_vl`, `step3vl`,
+    `glm5next`), each exporting `HARNESS_CONFIG`: reference repo + file list,
+    convert-script path, compare label, default images. All of them currently point
     `default_images` at the shared `DEFAULT_IMAGES` set in `src/gen_images.py`.
   - `src/gen_images.py` - shared, model-agnostic test-image generator; also
     defines `DEFAULT_IMAGES`, the default image set shared by every family for now
@@ -81,6 +83,7 @@ The key differs by tower shape:
 |-----------------|-------------------------------------------|-------------------------|
 | `kimik25`       | image basename (`cat.png`)                | none                    |
 | `minimax_m3_vl` | image basename                            | none                    |
+| `glm5next`      | image basename                            | none                    |
 | `step3vl`       | `<image>.<view>` (`overview`, `slice0`..) | `reference_layout.json` |
 
 `step3vl` splits an image into one key per view and records the per-image model
@@ -132,8 +135,8 @@ whether those numbers are good enough is the reader's call, not the agent's.
 
 ## Common arguments
 
-`--model <family>` (required) selects the family: `kimik25`, `minimax_m3_vl`, or
-`step3vl`. The remaining flags - `--image`, `--quant`, `--cpu`, and
+`--model <family>` (required) selects the family: `kimik25`, `minimax_m3_vl`,
+`step3vl`, or `glm5next`. The remaining flags - `--image`, `--quant`, `--cpu`, and
 `--ik-image-preprocessing` - apply across families.
 
 ### `--image <name>:<W>:<H> [...]`
@@ -163,13 +166,16 @@ Uses ik_llama's preprocessing, so that the encoders get the same pixels.
 | `kimik25`       | `/tmp/kimik25_pre`       |
 | `minimax_m3_vl` | `/tmp/minimax_m3_vl_pre` |
 | `step3vl`       | `/tmp/step3vl_pre`       |
+| `glm5next`      | `/tmp/glm5next_pre`      |
 
 **Parity risk (not yet validated).** The `minimax_m3_vl` patch unfold is a
 hand-written replica of the HF processor's unfold and is not validated against
 it. `kimik25` no longer carries this risk: under `--ik-image-preprocessing` it
 runs the checkpoint's own `navit_patchify` on ik's pixels (a scoped monkeypatch
 swaps ik's normalized pixels in at the processor's unfold seam, asserting the
-grid matches), so the reference unfold is the processor's own.
+grid matches), so the reference unfold is the processor's own. `glm5next` never
+carried it either: its processor exposes `patchify` as a plain method, which
+`ref_encode.py` calls directly on ik's pixels.
 
 **Temp-dir cleanup (future work).** The dump directory names above are hardcoded
 in two places per harness (the C++ wrapper and `ref_encode.py`) and diverge by
@@ -177,12 +183,12 @@ model. A future pass should centralize them (a shared constant or an argument).
 
 ## Support matrix
 
-| argument                   | `kimik25` | `minimax_m3_vl` | `step3vl` |
-|----------------------------|:---------:|:---------------:|:---------:|
-| `--image`                  |    yes    |       yes       |    yes    |
-| `--quant`                  |    yes    |       yes       |    yes    |
-| `--cpu`                    |    yes    |       yes       |    yes    |
-| `--ik-image-preprocessing` |    yes    |       yes       |    yes    |
+| argument                   | `kimik25` | `minimax_m3_vl` | `step3vl` | `glm5next` |
+|----------------------------|:---------:|:---------------:|:---------:|:----------:|
+| `--image`                  |    yes    |       yes       |    yes    |    yes     |
+| `--quant`                  |    yes    |       yes       |    yes    |    yes     |
+| `--cpu`                    |    yes    |       yes       |    yes    |    yes     |
+| `--ik-image-preprocessing` |    yes    |       yes       |    yes    |    yes     |
 
 ## Comment and docstring conventions
 

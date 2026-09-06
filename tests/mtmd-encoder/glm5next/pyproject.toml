@@ -1,0 +1,27 @@
+[project]
+name = "glm5next-vision-parity"
+version = "0.0.0"
+description = "Parity test: ik_llama.cpp glm5next vision tower vs the HF reference encoder"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch",
+    "torchvision",  # GLM-5.3-Flash's image processor is a torchvision-backed fast processor
+    "transformers>=5.16.1",  # first release carrying the glm5_next vision tower
+    "safetensors",
+    "numpy",
+    "pillow",
+    # repo-local gguf-py, so the generated mmproj is byte-compatible with ik's clip loader
+    "gguf",
+]
+
+# CPU-only torch: the reference runs a handful of small images, so we avoid
+# CUDA-version matching entirely and keep the download lean.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+gguf = { path = "../../../gguf-py", editable = true }
