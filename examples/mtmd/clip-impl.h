@@ -42,6 +42,7 @@
 #define KEY_SPATIAL_MERGE_SIZE  "clip.vision.spatial_merge_size"
 #define KEY_TEMPORAL_PATCH_SIZE "clip.vision.temporal_patch_size"
 #define KEY_IS_DEEPSTACK_LAYERS "clip.vision.is_deepstack_layers"
+#define KEY_VISION_SWIGLU_LIMIT "clip.vision.swiglu_limit"
 
 #define KEY_MM_PATCH_MERGE_TYPE   "clip.vision.mm_patch_merge_type"
 #define KEY_IMAGE_GRID_PINPOINTS  "clip.vision.image_grid_pinpoints"
@@ -96,7 +97,9 @@
 #define TN_MM_INP_PROJ     "mm.input_projection.weight" // gemma3
 #define TN_MM_SOFT_EMB_N   "mm.soft_emb_norm.weight"    // gemma3
 #define TN_MM_PROJECTOR    "mm.model.fc.weight"         // idefics3
-#define TN_MM_PATCH_MERGER "mm.patch_merger.weight"     // mistral small 3.1
+#define TN_MM_PATCH_MERGER "mm.patch_merger.weight"     // mistral small 3.1, glm5next
+#define TN_MM_PATCH_MERGER_B "mm.patch_merger.bias"     // glm5next
+#define TN_MM_POST_NORM    "mm.post_norm.%s"            // glm5next
 #define TN_TOK_IMG_BREAK   "v.token_embd.img_break"     // pixtral
 #define TN_TOK_IMG_START   "v.token_embd.img_start"     // deepseek4v
 #define TN_TOK_IMG_END     "v.token_embd.img_end"       // deepseek4v
@@ -192,6 +195,7 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEK4V,
     PROJECTOR_TYPE_DEEPSEEK41,
     PROJECTOR_TYPE_STEP3VL,
+    PROJECTOR_TYPE_GLM5NEXT,
     PROJECTOR_TYPE_UNKNOWN,
 
 };
@@ -222,6 +226,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_KIMIK25,   "kimik25"},
     { PROJECTOR_TYPE_LIGHTONOCR,"lightonocr"},
     { PROJECTOR_TYPE_COGVLM,    "cogvlm"},
+    { PROJECTOR_TYPE_GLM5NEXT,  "glm5next"},
     { PROJECTOR_TYPE_JANUS_PRO, "janus_pro"},
     { PROJECTOR_TYPE_MINIMAX_M3_VL, "minimax_m3_vl"},
     { PROJECTOR_TYPE_DEEPSEEK4V, "deepseek4v"},
