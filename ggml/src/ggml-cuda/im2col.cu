@@ -1,10 +1,17 @@
 #include "im2col.cuh"
 
+// CUDA caps gridDim.y and gridDim.z at 65535, which OH and batch*IC both overrun on
+// realistic inputs (a 2x2 patch merger over a native-resolution ViT reaches batch*IC in the
+// hundreds of thousands). The launch clamps those two dimensions and each block strides
+// through the remainder, so the kernel covers the full range whatever the grid was cut to.
+#define CUDA_IM2COL_MAX_GRIDDIM_Y 65535
+#define CUDA_IM2COL_MAX_GRIDDIM_Z 65535
+
 template <typename T>
 static  __global__ void im2col_kernel(
         const float * x, T * dst, int64_t batch_offset,
         int64_t offset_delta, int64_t IC, int64_t IW, int64_t IH, int64_t OH, int64_t OW, int64_t KW, int64_t KH, int64_t pelements, int64_t CHW,
-        int s0, int s1, int p0, int p1, int d0, int d1) {
+        int64_t batch_IC, int s0, int s1, int p0, int p1, int d0, int d1) {
     const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i >= pelements) {
         return;
@@ -16,22 +23,25 @@ static  __global__ void im2col_kernel(
     const int64_t  ky = (i - kd) / OW;
     const int64_t  ix = i % OW;
 
-    const int64_t  oh = blockIdx.y;
-    const int64_t  batch = blockIdx.z / IC;
-    const int64_t  ic = blockIdx.z % IC;
+    for (int64_t oh = blockIdx.y; oh < OH; oh += gridDim.y) {
+        for (int64_t bic = blockIdx.z; bic < batch_IC; bic += gridDim.z) {
+            const int64_t  batch = bic / IC;
+            const int64_t  ic = bic % IC;
 
-    const int64_t iiw = ix * s0 + kx * d0 - p0;
-    const int64_t iih = oh * s1 + ky * d1 - p1;
+            const int64_t iiw = ix * s0 + kx * d0 - p0;
+            const int64_t iih = oh * s1 + ky * d1 - p1;
 
-    const int64_t offset_dst =
-        ((batch * OH + oh) * OW + ix) * CHW +
-        (ic * (KW * KH) + ky * KW + kx);
+            const int64_t offset_dst =
+                ((batch * OH + oh) * OW + ix) * CHW +
+                (ic * (KW * KH) + ky * KW + kx);
 
-    if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
-        dst[offset_dst] = 0.0f;
-    } else {
-        const int64_t offset_src = ic * offset_delta + batch * batch_offset;
-        dst[offset_dst] = x[offset_src + iih * IW + iiw];
+            if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
+                dst[offset_dst] = 0.0f;
+            } else {
+                const int64_t offset_src = ic * offset_delta + batch * batch_offset;
+                dst[offset_dst] = x[offset_src + iih * IW + iiw];
+            }
+        }
     }
 }
 
@@ -42,8 +52,11 @@ static void im2col_cuda(const float * x, T* dst,
     int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
     const int parallel_elements = OW * KW * KH;
     const int num_blocks = (parallel_elements + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
-    dim3 block_nums(num_blocks, OH, batch * IC);
-    im2col_kernel<<<block_nums, CUDA_IM2COL_BLOCK_SIZE, 0, stream>>>(x, dst, batch_offset, offset_delta, IC, IW, IH, OH, OW, KW, KH, parallel_elements, (IC * KH * KW), s0, s1, p0, p1, d0, d1);
+    const int64_t batch_IC = batch * IC;
+    dim3 block_nums(num_blocks,
+                    OH       < CUDA_IM2COL_MAX_GRIDDIM_Y ? OH       : CUDA_IM2COL_MAX_GRIDDIM_Y,
+                    batch_IC < CUDA_IM2COL_MAX_GRIDDIM_Z ? batch_IC : CUDA_IM2COL_MAX_GRIDDIM_Z);
+    im2col_kernel<<<block_nums, CUDA_IM2COL_BLOCK_SIZE, 0, stream>>>(x, dst, batch_offset, offset_delta, IC, IW, IH, OH, OW, KW, KH, parallel_elements, (IC * KH * KW), batch_IC, s0, s1, p0, p1, d0, d1);
 }
 
 static void im2col_cuda_f16(const float * x, half * dst,
